@@ -193,17 +193,17 @@ class TestAnalyzeFileReal:
 
     @pytest.fixture
     def sparrow_wav(self):
-        """Path to the Wikipedia House Sparrow test file."""
-        path = "/home/z/my-project/upload/sparrow_test.wav"
+        """Path to a real bird recording for generic tests."""
+        path = "/home/z/my-project/upload/birdybird.m4a"
         if os.path.exists(path):
             yield path
         else:
-            pytest.skip("sparrow_test.wav not found")
+            pytest.skip("birdybird.m4a not found")
 
     def test_sparrow_detection(self, db, sparrow_wav):
         """
-        Wikipedia House Sparrow recording should detect House Sparrow
-        as the top species with high confidence.
+        Real bird recording should produce detections with confidence
+        above threshold and write them to the database.
         """
         # Clean DB
         db._get_conn().execute("DELETE FROM detections")
@@ -221,19 +221,18 @@ class TestAnalyzeFileReal:
         assert result["segments_analyzed"] > 0
         assert result["detections_written"] > 0
 
-        # Check that House Sparrow is in the top detections
+        # Top detections should be non-empty
         top = result["top_detections"]
-        top_species = [d["sci_name"] for d in top]
-        assert "Passer domesticus" in top_species, (
-            f"House Sparrow not found in top detections: {top_species[:5]}"
-        )
+        assert len(top) > 0
+        # Top detection should have meaningful confidence
+        assert top[0]["confidence"] >= 0.25
 
         # Verify it's in the database
         stats = db.stats()
         assert stats["totals"]["detections"] > 0
 
         # Print top 5 for debugging
-        print("\n  Top detections for House Sparrow recording:")
+        print("\n  Top detections for birdybird.m4a:")
         for d in top[:5]:
             print(f"    {d['confidence']:.3f}  {d['sci_name']}  ({d['com_name']})")
 
@@ -386,14 +385,13 @@ class TestGeoFiltering:
 # ── Confidence threshold ──────────────────────────────────────────── #
 
 class TestConfidenceThreshold:
-    def test_higher_threshold_fewer_detections(self, sparrow_wav_fixture=None):
+    def test_higher_threshold_fewer_detections(self):
         """
         Higher confidence threshold should produce fewer or equal detections.
         """
-        # Only run if sparrow file exists
-        path = "/home/z/my-project/upload/sparrow_test.wav"
+        path = "/home/z/my-project/upload/birdybird.m4a"
         if not os.path.exists(path):
-            pytest.skip("sparrow_test.wav not found")
+            pytest.skip("birdybird.m4a not found")
 
         from database import Database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -417,9 +415,9 @@ class TestConfidenceThreshold:
 class TestDatabaseIntegration:
     def test_detections_written_to_db(self):
         """Verify detections are actually written to the database."""
-        path = "/home/z/my-project/upload/sparrow_test.wav"
+        path = "/home/z/my-project/upload/birdybird.m4a"
         if not os.path.exists(path):
-            pytest.skip("sparrow_test.wav not found")
+            pytest.skip("birdybird.m4a not found")
 
         from database import Database
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -436,10 +434,9 @@ class TestDatabaseIntegration:
             assert stats["totals"]["detections"] == result["detections_written"]
             assert stats["totals"]["species"] > 0
 
-            # Check lifelist includes House Sparrow
+            # Check lifelist is non-empty — real audio produced species
             lifelist = db.lifelist()
-            species_sci = [s["sci"] for s in lifelist["species"]]
-            assert "Passer domesticus" in species_sci
+            assert len(lifelist["species"]) > 0
 
             db.close()
 

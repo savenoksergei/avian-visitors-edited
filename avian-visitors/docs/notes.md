@@ -1,6 +1,32 @@
 # AvianVisitors Desktop — журнал разработки
 
-Проект: адаптация AvianVisitors (BirdNET-Pi) для работы на обычном ноутбуке.
+## Что это и зачем
+
+Цель: десктопное приложение для автоматической идентификации птиц по звуку.
+Микрофон ноутбука непрерывно слушает окружение, BirdNET анализирует 3-секундные
+сегменты, детекции сохраняются в SQLite и отображаются на веб-дашборде в браузере.
+
+Источник вдохновения: AvianVisitors / BirdNET-Pi
+(ветка avian-visitors) — проект для Raspberry Pi с PHP-бэкендом.
+
+### Отличие от оригинального AvianVisitors
+
+| | Оригинал (BirdNET-Pi) | Наш проект (Desktop) |
+|---|---|---|
+| Платформа | Raspberry Pi (ARM) | Обычный ноутбук (x86_64) |
+| Бэкенд | PHP (birdnet-api.php) | Python (FastAPI) |
+| БД | SQLite через PHP | SQLite через Python (stdlib) |
+| Анализ | birdnet-analyze (CLI subprocess) | birdnet-analyzer (Python API напрямую) |
+| Фронтенд | HTML/JS/CSS из репо | Тот же фронтенд, минимальные JS-правки |
+| Аудиозахват | arecord (ALSA) | sounddevice (PortAudio) |
+| Сохранение аудио | Да, WAV-файлы на диск | Нет, только детекции в БД |
+| Запуск | systemd-сервис | Один `python main.py` |
+| Зависимости | системные пакеты RPi | pip install + venv |
+
+Ключевое упрощение: оригинал написан для RPi и завязан на его экосистему
+(ALSA, systemd, PHP, системные пакеты). Мы переписываем бэкенд на Python,
+сохраняя фронтенд и SQL-схему 1:1, чтобы запускать на любом ноутбуке.
+
 Репозиторий-источник: https://github.com/Twarner491/AvianVisitors (ветка avian-visitors)
 
 ---
@@ -50,6 +76,151 @@ avian-visitors/
 5. Адаптация фронтенда (JS-правки)
 6. main.py — единая точка входа
 7. requirements.txt + README.md
+
+---
+
+## Развёртывание в новом чате
+
+**Проблема:** при потере контекста чата (или запуске в новой сессии) проект нужно быстро поднять из репозитория и подготовить окружение. Ниже — полный чеклист.
+
+### 1. Git-репозиторий
+
+```bash
+cd /home/z/my-project
+git clone git@github.com:<user>/avian-visitors.git
+cd avian-visitors
+```
+
+Локальный путь: `/home/z/my-project/avian-visitors/`
+Пакет (Python модули): `/home/z/my-project/avian-visitors/avian-visitors/`
+Тесты: `/home/z/my-project/avian-visitors/avian-visitors/test_*.py`
+Документация: `/home/z/my-project/avian-visitors/avian-visitors/docs/notes.md`
+
+### 2. Python-окружение
+
+Проект использует venv с Python 3.12. Все зависимости уже установлены в
+`/home/z/.venv/`. Если venv отсутствует:
+
+```bash
+python3.12 -m venv /home/z/.venv
+source /home/z/.venv/bin/activate
+pip install -r requirements.txt   # после Части 7
+# Или вручную:
+pip install fastapi uvicorn sounddevice numpy librosa birdnet-analyzer pytest
+```
+
+**Критически важно:** `birdnet-analyzer` (оригинал от Kai Hilbert / Cornell),
+НЕ `birdnet` (сторонний пакет, даёт неверные результаты).
+
+### 3. BirdNET модель (~262 MB)
+
+Пакет `birdnet-analyzer` из PyPI содержит только Python-код. Модель (TFLite +
+лейблы + metadata) НЕ входит в pip-пакет и скачивается отдельно.
+
+**Одноразовая установка модели:**
+
+```python
+python -c "from birdnet_analyzer.utils import ensure_model_exists; ensure_model_exists()"
+# Output: "Model found!" или "Downloading..."
+```
+
+Эта команда скачивает checkpoints в `birdnet_analyzer/checkpoints/V2.4/`.
+Файлы:
+- `BirdNET_V2.4_Model.tflite` — основная модель (~236 MB)
+- `Labels.txt` — 6522 записи вида `"Genus species_Common Name"`
+- `eBird_Taxonomy_v2021.csv`
+- `Species_List.csv` (нужен для мета-модели?) и другие вспомогательные
+
+**Куда ложатся файлы (автоматически):**
+```
+/home/z/.venv/lib/python3.12/site-packages/birdnet_analyzer/checkpoints/V2.4/
+```
+
+**Проверка:**
+```bash
+python -c "from birdnet_analyzer.utils import ensure_model_exists; ensure_model_exists(); print('OK')"
+```
+
+**Альтернатива (копирование из другого окружения):**
+Если модель уже скачана в другом Python-окружении (например, Python 3.13 в
+`/home/z/.local/lib/python3.13/`), можно скопировать:
+
+```bash
+cp -r /home/z/.local/lib/python3.13/site-packages/birdnet_analyzer/checkpoints \
+      /home/z/.venv/lib/python3.12/site-packages/birdnet_analyzer/checkpoints
+```
+
+Но `ensure_model_exists()` предпочтительнее — она скачает актуальную версию
+прямо из источника.
+
+### 4. Тестовые аудиофайлы (реальные записи птиц)
+
+Тесты `test_audio_capture.py` используют 2 реальные записи с пением птиц.
+Они хранятся в:
+
+```
+/home/z/my-project/avian-visitors/test_audio/
+├── birdybird.m4a    (~60 KB, 6.6 сек — Большая синица, confidence 0.981)
+├── birdybird.wav    (конвертированный, 618 KB, 48kHz mono s16)
+├── birdybird2.m4a   (~87 KB, 9.8 сек — Славка-черногрудка, confidence 0.708)
+└── birdybird2.wav   (конвертированный, 914 KB, 48kHz mono s16)
+```
+
+Тесты ищут m4a-файлы по симлинкам:
+```
+/home/z/my-project/upload/birdybird.m4a  →  ../avian-visitors/test_audio/birdybird.m4a
+/home/z/my-project/upload/birdybird2.m4a →  ../avian-visitors/test_audio/birdybird2.m4a
+```
+
+**Исходные файлы на Яндекс Диске (для повторного скачивания):**
+- birdybird.m4a: https://disk.yandex.ru/d/DQNjtRviDerDNw
+- birdybird2.m4a: https://disk.yandex.ru/d/sU4SIQJj_nomRg
+
+**Как скачать с Яндекс Диска (headless):**
+1. Открыть ссылку в `agent-browser`
+2. `snapshot -i` → найти кнопку «Скачать» (ref)
+3. `network route "https://downloader.disk.yandex.ru/*"` — перехват запроса
+4. `click @<ref>` → кликнуть «Скачать»
+5. `network requests --filter downloader` — получить прямой URL
+6. `curl -L -o filename.m4a "<прямой_URL>"`
+
+**Конвертация m4a → wav (если нужны):**
+```bash
+ffmpeg -i birdybird.m4a -ar 48000 -ac 1 -sample_fmt s16 birdybird.wav -y
+```
+
+**Ожидаемые результаты BirdNET:**
+
+| Файл | Вид | Confidence |
+|------|-----|------------|
+| birdybird.m4a | Parus major (Great Tit / Большая синица) | 0.981 |
+| birdybird2.m4a | Luscinia luscinia (Thrush Nightingale / Славка-черногрудка) | 0.708 |
+
+### 5. Быстрая проверка после развёртывания
+
+```bash
+cd /home/z/my-project/avian-visitors
+source /home/z/.venv/bin/activate
+
+# 1. Модель на месте?
+python -c "from birdnet_analyzer.utils import ensure_model_exists; ensure_model_exists()"
+
+# 2. Тестовые аудио на месте?
+ls -la /home/z/my-project/upload/birdybird.m4a /home/z/my-project/upload/birdybird2.m4a
+
+# 3. Все тесты проходят?
+python -m pytest avian-visitors/test_audio_capture.py avian-visitors/test_api.py -v
+# Ожидание: 61 passed, 0 failed, 0 skipped
+```
+
+### 6. ENV-переменные
+
+| Переменная | Default | Описание |
+|-----------|---------|----------|
+| `AVIAN_NO_AUDIO` | unset | `=1` отключает AudioListener (тесты, CI) |
+| `AVIAN_LAT` | 55.75 | Широта для geo-фильтрации |
+| `AVIAN_LON` | 37.62 | Долгота для geo-фильтрации |
+| `AVIAN_CONFIDENCE` | 0.25 | Порог уверенности BirdNET |
 
 ---
 
