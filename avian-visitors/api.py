@@ -36,7 +36,7 @@ from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from database import Database
@@ -336,6 +336,31 @@ def _find_image(sci: str, pose: int = 1) -> Optional[Path]:
     return None
 
 
+async def _wiki_thumb_url(sci: str) -> Optional[str]:
+    """Return a validated Wikipedia thumbnail URL for a species, or None.
+
+    Used as the image fallback for species without bundled artwork. Only
+    wikimedia.org / wikipedia.org hosts are allowed (SSRF protection).
+    """
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{sci}"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers={"User-Agent": _WIKIPEDIA_UA})
+            if resp.status_code != 200:
+                return None
+            data = resp.json()
+    except (httpx.TimeoutException, httpx.RequestError):
+        return None
+
+    raw_thumb = (data.get("thumbnail") or {}).get("source")
+    if not raw_thumb:
+        return None
+    host = urlparse(raw_thumb).hostname or ""
+    if _WIKIMEDIA_HOST_RE.match(host):
+        return raw_thumb
+    return None
+
+
 @app.get("/api/cutout")
 async def cutout(
     sci: str = Query(..., description="Scientific name, e.g. 'Parus major'"),
@@ -347,22 +372,35 @@ async def cutout(
       1. Bundled kachō-e illustration with pose suffix
       2. Bundled kachō-e illustration default pose (fallback for missing pose variant)
       3. Bundled background-removed photo (cutout)
-      4. 404 if nothing found
+      4. Wikipedia thumbnail (302 redirect) for species without bundled art
+      5. 404 if nothing found
 
-    Response is a PNG with Cache-Control: public, max-age=86400 (24h).
+    Bundled art is returned as a PNG with Cache-Control: public, max-age=86400 (24h).
+    The bundled assets only cover ~249 (mostly North-American) species, so for
+    everything else (e.g. Eurasian birds heard in Moscow) we fall back to a
+    Wikipedia photo so the species still shows up on the frontend.
     """
     if not _SCI_RE.match(sci):
         raise HTTPException(status_code=400, detail="invalid sci")
 
     image_path = _find_image(sci, pose)
-    if image_path is None:
-        raise HTTPException(status_code=404, detail=f"no illustration for {sci}")
+    if image_path is not None:
+        return FileResponse(
+            image_path,
+            media_type="image/png",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
 
-    return FileResponse(
-        image_path,
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
+    # No bundled art — fall back to a Wikipedia photo if one exists.
+    thumb_url = await _wiki_thumb_url(sci)
+    if thumb_url:
+        return RedirectResponse(
+            thumb_url,
+            status_code=302,
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    raise HTTPException(status_code=404, detail=f"no illustration for {sci}")
 
 
 # ── Wikipedia summary proxy (/api/wiki) ────────────────────────────── #

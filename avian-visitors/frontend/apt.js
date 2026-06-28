@@ -280,6 +280,18 @@
     return (maskCache[slug] = { w: w, h: h, cells: cells });
   }
 
+  // Solid rectangular mask for species without a bundled silhouette
+  // (e.g. ones shown via a Wikipedia photo). Lets them nest & render in
+  // the collage instead of being dropped.
+  function rectMask(ar) {
+    var w = 16, h = Math.max(1, Math.round(16 / (ar || 1.4)));
+    var cells = [];
+    for (var y = 0; y < h; y++) {
+      for (var x = 0; x < w; x++) cells.push([x, y]);
+    }
+    return { w: w, h: h, cells: cells };
+  }
+
   function slugify(sci) {
     return sci.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
   }
@@ -446,8 +458,13 @@
       var slug = pose === 2 ? base + '-2' : base;
       var mask = loadMask(slug);
       if (!mask && pose === 2) { pose = 1; slug = base; mask = loadMask(slug); collagePose[s.sci] = 1; }
-      if (!mask) return null;
       var d = DIMS[slug];
+      if (!mask) {
+        // No bundled silhouette — show it anyway (image comes from the
+        // Wikipedia fallback in /api/cutout) using a rectangular mask.
+        pose = 1; collagePose[s.sci] = 1;
+        mask = rectMask(d ? d[0] / d[1] : 1.4);
+      }
       var n = +s.n; if (!n || isNaN(n)) n = 1;
       return {
         mask: mask, data: s, pose: pose,
