@@ -1,0 +1,36 @@
+Selection	View	Channel	Begin Time (s)	End Time (s)	Low Freq (Hz)	High Freq (Hz)	Common Name	Species Code	Confidence	Begin Path	File Offset (s)
+1	Spectrogram 1	1	0.0	3.0	0	15000	House Sparrow	houspa	0.6668	/home/z/my-project/upload/sparrow_short.wav	0.0
+2	Spectrogram 1	1	0.0	3.0	0	15000	Spanish Sparrow	spaspa1	0.0122	/home/z/my-project/upload/sparrow_short.wav	0.0
+3	Spectrogram 1	1	0.0	3.0	0	15000	Richard's Pipit	ricpip1	0.0047	/home/z/my-project/upload/sparrow_short.wav	0.0
+4	Spectrogram 1	1	0.0	3.0	0	15000	Black Redstart	blared1	0.0032	/home/z/my-project/upload/sparrow_short.wav	0.0
+5	Spectrogram 1	1	0.0	3.0	0	15000	Common Grasshopper-Warbler	cogwar1	0.0025	/home/z/my-project/upload/sparrow_short.wav	0.0
+6	Spectrogram 1	1	3.0	6.0	0	15000	Eurasian Blackbird	eurbla	0.0205	/home/z/my-project/upload/sparrow_short.wav	3.0
+7	Spectrogram 1	1	3.0	6.0	0	15000	Eurasian Golden Oriole	eugori2	0.0139	/home/z/my-project/upload/sparrow_short.wav	3.0
+8	Spectrogram 1	1	3.0	6.0	0	15000	Common Wood-Pigeon	cowpig1	0.0088	/home/z/my-project/upload/sparrow_short.wav	3.0
+9	Spectrogram 1	1	3.0	6.0	0	15000	Common House-Martin	cohmar1	0.0078	/home/z/my-project/upload/sparrow_short.wav	3.0
+10	Spectrogram 1	1	3.0	6.0	0	15000	Black Redstart	blared1	0.0044	/home/z/my-project/upload/sparrow_short.wav	3.0
+11	Spectrogram 1	1	6.0	9.0	0	15000	House Sparrow	houspa	0.3168	/home/z/my-project/upload/sparrow_short.wav	6.0
+12	Spectrogram 1	1	6.0	9.0	0	15000	Spanish Sparrow	spaspa1	0.0751	/home/z/my-project/upload/sparrow_short.wav	6.0
+13	Spectrogram 1	1	6.0	9.0	0	15000	Common Wood-Pigeon	cowpig1	0.0139	/home/z/my-project/upload/sparrow_short.wav	6.0
+14	Spectrogram 1	1	6.0	9.0	0	15000	Eurasian Tree Sparrow	eutspa	0.0062	/home/z/my-project/upload/sparrow_short.wav	6.0
+15	Spectrogram 1	1	6.0	9.0	0	15000	Common Grasshopper-Warbler	cogwar1	0.0054	/home/z/my-project/upload/sparrow_short.wav	6.0
+16	Spectrogram 1	1	9.0	12.0	0	15000	House Sparrow	houspa	0.5125	/home/z/my-project/upload/sparrow_short.wav	9.0
+17	Spectrogram 1	1	9.0	12.0	0	15000	Spanish Sparrow	spaspa1	0.0525	/home/z/my-project/upload/sparrow_short.wav	9.0
+18	Spectrogram 1	1	9.0	12.0	0	15000	Eurasian Tree Sparrow	eutspa	0.0070	/home/z/my-project/upload/sparrow_short.wav	9.0
+19	Spectrogram 1	1	9.0	12.0	0	15000	Black Redstart	blared1	0.0046	/home/z/my-project/upload/sparrow_short.wav	9.0
+20	Spectrogram 1	1	9.0	12.0	0	15000	Common Grasshopper-Warbler	cogwar1	0.0028	/home/z/my-project/upload/sparrow_short.wav	9.0
+21	Spectrogram 1	1	12.0	15.0	0	15000	House Sparrow	houspa	0.8328	/home/z/my-project/upload/sparrow_short.wav	12.0
+22	Spectrogram 1	1	12.0	15.0	0	15000	Eurasian Tree Sparrow	eutspa	0.0075	/home/z/my-project/upload/sparrow_short.wav	12.0
+23	Spectrogram 1	1	12.0	15.0	0	15000	Black Redstart	blared1	0.0062	/home/z/my-project/upload/sparrow_short.wav	12.0
+24	Spectrogram 1	1	12.0	15.0	0	15000	Spanish Sparrow	spaspa1	0.0060	/home/z/my-project/upload/sparrow_short.wav	12.0
+25	Spectrogram 1	1	12.0	15.0	0	15000	Eurasian Blackbird	eurbla	0.0011	/home/z/my-project/upload/sparrow_short.wav	12.0
+26	Spectrogram 1	1	15.0	18.0	0	15000	House Sparrow	houspa	0.6555	/home/z/my-project/upload/sparrow_short.wav	15.0
+27	Spectrogram 1	1	15.0	18.0	0	15000	Black Redstart	blared1	0.0426	/home/z/my-project/upload/sparrow_short.wav	15.0
+28	Spectrogram 1	1	15.0	18.0	0	15000	Common Redstart	comred2	0.0119	/home/z/my-project/upload/sparrow_short.wav	15.0
+29	Spectrogram 1	1	15.0	18.0	0	15000	Spanish Sparrow	spaspa1	0.0072	/home/z/my-project/upload/sparrow_short.wav	15.0
+30	Spectrogram 1	1	15.0	18.0	0	15000	Eurasian Blackbird	eurbla	0.0052	/home/z/my-project/upload/sparrow_short.wav	15.0
+31	Spectrogram 1	1	18.0	20.0	0	15000	House Sparrow	houspa	0.6074	/home/z/my-project/upload/sparrow_short.wav	18.0
+32	Spectrogram 1	1	18.0	20.0	0	15000	Spanish Sparrow	spaspa1	0.0835	/home/z/my-project/upload/sparrow_short.wav	18.0
+33	Spectrogram 1	1	18.0	20.0	0	15000	Eurasian Tree Sparrow	eutspa	0.0061	/home/z/my-project/upload/sparrow_short.wav	18.0
+34	Spectrogram 1	1	18.0	20.0	0	15000	Eurasian Collared-Dove	eucdov	0.0028	/home/z/my-project/upload/sparrow_short.wav	18.0
+35	Spectrogram 1	1	18.0	20.0	0	15000	Black Redstart	blared1	0.0021	/home/z/my-project/upload/sparrow_short.wav	18.0
