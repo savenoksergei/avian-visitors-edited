@@ -13,8 +13,17 @@ avian-visitors/.pytest_cache/
 # Tool output
 tool-results/
 
-# Uploaded audio
+# Uploaded audio (runtime / debug)
 upload/
+
+# Downloaded artifacts
+download/
+
+# Test audio (large binary, not for git)
+test_audio/
+
+# Environment
+.env
 
 # Skills (internal)
 skills/
