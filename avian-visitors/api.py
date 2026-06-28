@@ -28,6 +28,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -401,6 +402,164 @@ async def wiki(
         },
         headers={"Cache-Control": "public, max-age=86400"},
     )
+
+
+# ── Recording endpoint (audio files) ────────────────────────────────── #
+# Desktop version: audio files are not saved to disk (File_Name is ''),
+# so this endpoint always returns 404. The frontend handles this gracefully
+# (shows "no audio" on cards, "No recordings yet." in modal).
+
+@app.get("/api/recording")
+async def recording(
+    sci: Optional[str] = Query(default=None, description="Scientific name"),
+    file: Optional[str] = Query(default=None, description="Audio file path"),
+):
+    """Serve an audio recording file.
+
+    In the Desktop edition, recordings are not persisted to disk,
+    so this always returns 404. Kept for frontend compatibility —
+    the JS already handles 404 gracefully (shows 'no audio').
+    """
+    raise HTTPException(status_code=404, detail="recordings not available in desktop mode")
+
+
+# ── Menu endpoint (auth + nav items) ────────────────────────────────── #
+# Desktop version: no auth required, no external admin pages.
+
+@app.get("/api/menu")
+@app.post("/api/menu")
+async def menu():
+    """Return navigation menu items.
+
+    In the original BirdNET-Pi this handles Caddy basic-auth and returns
+    a list of {label, href, native} items for the drawer.  The Desktop
+    edition has no external admin pages, so we return only the in-app
+    Settings link (which uses the config endpoint below).
+    """
+    return {
+        "items": [
+            {"label": "Settings", "href": "#admin=settings", "native": True},
+        ],
+    }
+
+
+# ── Config endpoint (settings read/write) ──────────────────────────── #
+# Desktop version: settings are read from environment variables and
+# written to a small JSON sidecar file.
+
+_CONFIG_FILE = _HERE / "data" / "desktop_config.json"
+
+
+def _read_config() -> dict:
+    """Merge environment-variable defaults with persisted overrides."""
+    values = {
+        "CONFIDENCE": float(os.environ.get("AVIAN_CONFIDENCE", str(CONFIDENCE_THRESHOLD))),
+        "SENSITIVITY": 1.0,
+        "OVERLAP": 0.0,
+        "FULL_DISK": "keep",
+        "PRESERVE": False,
+    }
+    if _CONFIG_FILE.is_file():
+        try:
+            import json
+            saved = json.loads(_CONFIG_FILE.read_text())
+            values.update(saved)
+        except Exception:
+            pass
+    return values
+
+
+@app.get("/api/config")
+async def config_read():
+    """Return current configuration values."""
+    return {"values": _read_config(), "preserve": False}
+
+
+@app.post("/api/config")
+async def config_write(body: dict):
+    """Persist configuration changes to the JSON sidecar."""
+    import json
+    _CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # Merge: only update keys that were sent
+    existing = {}
+    if _CONFIG_FILE.is_file():
+        try:
+            existing = json.loads(_CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    existing.update(body)
+    _CONFIG_FILE.write_text(json.dumps(existing, indent=2))
+    return {"ok": True}
+
+
+# ── Status endpoint (system diagnostics) ────────────────────────────── #
+# Desktop version: no systemd, no Icecast. Returns basic info.
+
+@app.get("/api/status")
+async def status_get(
+    action: str = Query(..., description="Action: diag, logs"),
+    unit: Optional[str] = Query(default=None),
+    lines: int = Query(default=120, ge=1, le=500),
+):
+    """System diagnostics stub for Desktop.
+
+    action=diag: returns basic system info (no systemd services).
+    action=logs: returns a message that logs are not available.
+    """
+    import platform
+    import psutil
+
+    if action == "diag":
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage(str(_HERE))
+        uptime_s = int(psutil.boot_time() and (time.time() - psutil.boot_time()))
+        return {
+            "system": {
+                "hostname": platform.node(),
+                "kernel": platform.release(),
+                "uptime": {"pretty": _fmt_seconds(uptime_s), "seconds": uptime_s},
+                "mem": {
+                    "used_bytes": mem.used,
+                    "total_bytes": mem.total,
+                    "used_pct": round(mem.percent, 1),
+                },
+                "temp_c": None,  # not available cross-platform
+            },
+            "services": {},    # no systemd in Desktop
+            "recent_logs": {},
+        }
+    elif action == "logs":
+        return {
+            "text": "Log viewing is not available in Desktop mode.\n"
+                    "Check the terminal where AvianVisitors is running.",
+        }
+    else:
+        raise HTTPException(status_code=400, detail=f"unknown action: {action}")
+
+
+@app.post("/api/status")
+async def status_post(
+    action: str = Query(..., description="Action: restart"),
+    unit: str = Query(..., description="Service unit name"),
+):
+    """Service restart stub — not applicable for Desktop."""
+    raise HTTPException(
+        status_code=501,
+        detail=f"Service restart not available in Desktop mode (unit: {unit})",
+    )
+
+
+def _fmt_seconds(s: int) -> str:
+    """Format seconds into a human-readable uptime string."""
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    d = s // 86400
+    h = (s % 86400) // 3600
+    return f"{d}d {h}h"
 
 
 # ── Static files & favicon (must be AFTER all /api/* routes) ────────── #

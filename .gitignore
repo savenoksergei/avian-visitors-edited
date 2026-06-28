@@ -6,9 +6,11 @@ __pycache__/
 *.pyo
 
 # Runtime data
-avian-visitors/data/birds.db
-avian-visitors/data/*.db
+avian-visitors/data/
 avian-visitors/.pytest_cache/
+
+# Scripts (internal tooling)
+scripts/
 
 # Tool output
 tool-results/

@@ -625,5 +625,123 @@ class TestWiki:
         assert not _WIKIMEDIA_HOST_RE.match("wikimedia.org.evil.com")
 
 
+# ════════════════════════════════════════════════════════════════════════ #
+#  Part 5: New stub endpoints (recording, menu, config, status)
+# ════════════════════════════════════════════════════════════════════════ #
+
+class TestRecordingEndpoint:
+    """GET /api/recording — always 404 in Desktop mode (no audio files saved)."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_recording_by_sci_404(self):
+        r = self.client.get("/api/recording?sci=Passer+domesticus")
+        assert r.status_code == 404
+
+    def test_recording_by_file_404(self):
+        r = self.client.get("/api/recording?file=some/path.wav")
+        assert r.status_code == 404
+
+
+class TestMenuEndpoint:
+    """GET/POST /api/menu — returns in-app Settings link for Desktop."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_menu_get_returns_settings(self):
+        r = self.client.get("/api/menu")
+        assert r.status_code == 200
+        data = r.json()
+        assert "items" in data
+        labels = [it["label"] for it in data["items"]]
+        assert "Settings" in labels
+
+    def test_menu_post_same_as_get(self):
+        r = self.client.post("/api/menu")
+        assert r.status_code == 200
+        data = r.json()
+        assert "items" in data
+
+
+class TestConfigEndpoint:
+    """GET/POST /api/config — reads/writes desktop_config.json."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_config_read(self):
+        r = self.client.get("/api/config")
+        assert r.status_code == 200
+        data = r.json()
+        assert "values" in data
+        assert "CONFIDENCE" in data["values"]
+        assert "preserve" in data
+
+    def test_config_write_and_reread(self):
+        # Write a custom value
+        r = self.client.post(
+            "/api/config",
+            json={"CONFIDENCE": 0.42, "FULL_DISK": "purge"},
+        )
+        assert r.status_code == 200
+        assert r.json()["ok"] is True
+
+        # Re-read and verify
+        r = self.client.get("/api/config")
+        data = r.json()
+        assert data["values"]["CONFIDENCE"] == 0.42
+        assert data["values"]["FULL_DISK"] == "purge"
+
+    def test_config_write_merges(self):
+        """Second write should merge with, not overwrite, previous values."""
+        self.client.post("/api/config", json={"SENSITIVITY": 1.3})
+        self.client.post("/api/config", json={"OVERLAP": 0.5})
+        r = self.client.get("/api/config")
+        v = r.json()["values"]
+        assert v["SENSITIVITY"] == 1.3
+        assert v["OVERLAP"] == 0.5
+
+
+class TestStatusEndpoint:
+    """GET/POST /api/status — system diagnostics stub for Desktop."""
+
+    @pytest.fixture(autouse=True)
+    def _client(self, client):
+        self.client = client
+
+    def test_status_diag(self):
+        r = self.client.get("/api/status?action=diag")
+        assert r.status_code == 200
+        data = r.json()
+        assert "system" in data
+        sys_ = data["system"]
+        assert "hostname" in sys_
+        assert "uptime" in sys_
+        assert "mem" in sys_
+        assert "used_pct" in sys_["mem"]
+        # No systemd services in Desktop
+        assert data["services"] == {}
+
+    def test_status_logs(self):
+        r = self.client.get("/api/status?action=logs&unit=test&lines=50")
+        assert r.status_code == 200
+        data = r.json()
+        assert "text" in data
+        assert "Desktop" in data["text"]
+
+    def test_status_restart_501(self):
+        r = self.client.post("/api/status?action=restart&unit=something")
+        assert r.status_code == 501
+
+    def test_status_unknown_action_400(self):
+        r = self.client.get("/api/status?action=foobar")
+        assert r.status_code == 400
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
