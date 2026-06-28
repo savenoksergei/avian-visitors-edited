@@ -88,14 +88,19 @@ async def lifespan(app: FastAPI):
         lon = float(os.environ.get("AVIAN_LON", str(LONGITUDE)))
         conf = float(os.environ.get("AVIAN_CONFIDENCE", str(CONFIDENCE_THRESHOLD)))
         sens = float(os.environ.get("AVIAN_SENSITIVITY", "1.0"))
+        # Parse optional audio device index
+        device_val = os.environ.get("AVIAN_AUDIO_DEVICE", "")
+        audio_device = int(device_val) if device_val else None
+
         listener = AudioListener(
             db, latitude=lat, longitude=lon,
             confidence_threshold=conf, sensitivity=sens,
+            device=audio_device,
         )
         listener.start()
         logger.info(
-            "Audio listener started (lat=%.2f, lon=%.2f, conf=%.2f, sens=%.1f)",
-            lat, lon, conf, sens,
+            "Audio listener started (lat=%.2f, lon=%.2f, conf=%.2f, sens=%.1f, device=%s)",
+            lat, lon, conf, sens, audio_device,
         )
 
     yield

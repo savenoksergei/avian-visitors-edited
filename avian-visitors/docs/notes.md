@@ -69,13 +69,70 @@ avian-visitors/
 
 ## План разбивки на части
 
-1. Скелет проекта + SQLite + database.py
-2. Аудиозахват + BirdNET анализ
-3. FastAPI: JSON-эндпоинты
-4. Статика + эндпоинт картинок + wiki-прокси
-5. Адаптация фронтенда (JS-правки)
-6. main.py — единая точка входа
-7. requirements.txt + README.md
+### Часть 1 — Скелет проекта + SQLite + database.py
+Что делаю:
+
+Создаю структуру директорий: frontend/, assets/, data/
+Копирую assets/ (illustrations + cutouts + favicon) из репо
+database.py — схема detections (те же поля, что в оригинале: Sci_Name, Com_Name, Confidence, Date, Time, File_Name), init, insert, все query-методы для будущих API
+Как проверить: python -c "from database import Database; db = Database(); db.init(); print(db.stats())" — должен создать data/birds.db и вернуть пустую статистику.
+
+### Часть 2 — Аудиозахват + BirdNET анализ
+Что делаю:
+
+audio_capture.py — sounddevice захват с микрофона (48kHz, моно), кольцевой буфер на 3 сек
+Каждый сегмент → birdnet модель (координаты Москвы: 55.75, 37.62)
+Результаты с confidence > 0.25 → запись в SQLite через database.py
+Работает в отдельном threading.Thread, управляется флагом running
+Как проверить: запустить python -c "from audio_capture import AudioListener; l = AudioListener(); l.start(); time.sleep(10); l.stop()" — через 10 сек должны появиться строки в БД (если есть звук птиц или хотя бы структура таблицы верна).
+
+### Часть 3 — FastAPI: JSON-эндпоинты
+Что делаю:
+
+api.py — все роуты, повторяющие структуру ответов PHP 1:1:
+GET /api/birdnet?action=stats
+GET /api/birdnet?action=lifelist
+GET /api/birdnet?action=recent&hours=N
+GET /api/birdnet?action=species&sci=...
+GET /api/birdnet?action=timeseries&days=30
+GET /api/birdnet?action=firstseen&limit=10
+Как проверить: uvicorn api:app --port 8000 → curl localhost:8000/api/birdnet?action=stats → должен вернуть JSON {"totals": {"detections": 0, "species": 0}, ...}.
+
+### Часть 4 — Статика + эндпоинт картинок
+Что делаю:
+
+api.py — статические файлы: / → frontend/index.html, /styles.css, /apt.js, /dims.json, /masks.json, /favicon.png
+GET /api/img?sci=...&pose=N — lookup chain: illustrations/{slug}.png → cutouts/{slug}.png → 404 (без rembg/Wikipedia)
+GET /api/wiki?sci=... — прокси к Wikipedia REST API
+Как проверить: открыть http://localhost:8000 в браузере — должна показаться пустая страница с плейсхолдерами (данных ещё нет, но HTML/CSS грузится). /api/img?sci=Columba+livia — должна вернуться картинка голубя.
+
+### Часть 5 — Адаптация фронтенда
+Что делаю:
+
+Копирую index.html, styles.css, dims.json, masks.json в frontend/
+Минимальные правки в apt.js:
+./avian/api/birdnet-api.php?action=X → /api/birdnet?action=X
+./avian/api/cutout.php?sci= → /api/img?sci=
+./avian/api/wiki.php?sci= → /api/wiki?sci=
+./avian/api/recording.php → заглушка (не playable)
+Убираю menu.php / config.php зависимости (делаю их no-op)
+Автополлинг оставляю (каждые 30 сек)
+Как проверить: открыть в браузере — все три вида (Collage / Stats / Atlas) должны рендериться. С тестовыми данными в БД — птицы появляются в коллаже.
+
+### Часть 6 — main.py: единая точка входа
+Что делаю:
+
+main.py — запускает аудиозахват в фоне (Thread), затем uvicorn на главном потоке
+Ctrl+C → останавливает оба (graceful shutdown через signal handler)
+Автооткрытие браузера: webbrowser.open('http://localhost:8000')
+Логирование в консоль: каждая детекция → строка в stdout
+Как проверить: python main.py — одна команда, открывается браузер, в консоли видны логи детекций.
+
+### Часть 7 — requirements.txt + README.md
+Что делаю:
+
+requirements.txt с точными версиями
+README.md на русском: описание, установка (pip install -r requirements.txt), запуск (python main.py), структура проекта, что нужно (микрофон), координаты
 
 ---
 
@@ -505,97 +562,5 @@ cd /home/z/my-project/avian-visitors/avian-visitors && python -m pytest test_api
 ```
 
 Все 36 тестов проходят. Время выполнения — 1.53 секунды.
-
----
-
-## Часть 4 — Статика + эндпоинт картинок + wiki-прокси
-
-**Статус:** ✅ готово (47/47 тестов, из них 11 новых)
-
-### Что сделано
-
-#### 4.1 Статические файлы и favicon
-
-- `StaticFiles(directory="frontend/", html=True)` смонтирован на `/`
-- Файлы `index.html`, `apt.js`, `styles.css`, `dims.json`, `masks.json`
-  отдаются из `frontend/` (будет скопировано в Части 5)
-- `/favicon.png` — отдельный route, отдает `assets/favicon.png`
-- `html=True` — запрос `/` отдаёт `index.html`
-
-**Важно:** StaticFiles монтируется **после** всех `/api/*` routes, иначе
-статика перехватила бы API-запросы.
-
-#### 4.2 `/api/cutout` — резолвер картинок птиц
-
-Порт оригинального `cutout.php`, но БЕЗ динамического Wikipedia+rembg фоллбека
-(шаги 3-4 из PHP). Десктоп-версия использует только локальные ассеты.
-
-**Цепочка поиска (lookup chain):**
-
-| Приоритет | Путь | Описание |
-|-----------|------|----------|
-| 1 | `assets/illustrations/<slug>-<pose>.png` | kachō-e, pose-specific (pose 2+ = flight) |
-| 2 | `assets/illustrations/<slug>.png` | kachō-e, perched (pose 1, default) |
-| 3 | `assets/cutouts/<slug>.png` | background-removed photo (fallback) |
-| 4 | 404 | ничего не найдено |
-
-**Slug-конверсия:** `"Parus major"` → `"parus-major"` (нижний регистр,
-пробелы → дефисы).
-
-**Валидация `sci`:** regex `^[A-Za-z]{2,40}(?: [a-z]{2,40}){1,3}$` —
-отклоняет path-traversal (`../etc/passwd`), SQL-инъекции, пустые строки.
-
-**Ассеты:** 498 illustrations (из них ~250 с pose-2) + 158 cutouts.
-
-**Cache-Control:** `public, max-age=86400` (24ч, как в оригинале).
-
-#### 4.3 `/api/wiki` — Wikipedia summary proxy
-
-Порт оригинального `wiki.php`. Проксирует запрос к:
-```
-https://en.wikipedia.org/api/rest_v1/page/summary/<sci>
-```
-
-**Возвращает:**
-```json
-{
-  "extract": "The great tit (Parus major) is a passerine bird...",
-  "thumbnail": {"source": "https://upload.wikimedia.org/..."},
-  "title": "Parus major"
-}
-```
-
-**SSRF-защита:** thumbnail URL проверяется regex — только хосты
-`*.wikimedia.org` и `*.wikipedia.org`. Если Wikipedia вернёт poisoned URL
-на другой домен, thumbnail будет `null`.
-
-**Грейсфул деградация:** если Wikipedia недоступен (timeout, network error) —
-возвращает `{extract: null, thumbnail: null, title: null}` с 200 OK.
-Тесты проверяют это.
-
-**User-Agent:** настраивается через `AV_USER_AGENT` env var
-(по умолчанию `AvianVisitors/1.0`).
-
-**Cache-Control:** `public, max-age=86400` (24ч).
-
-#### 4.4 Новые зависимости
-
-- `httpx` — async HTTP client для Wikipedia proxy (уже был установлен).
-
-#### 4.5 test_api.py — 11 новых тестов
-
-| Класс | Тесты | Что проверяют |
-|-------|-------|---------------|
-| TestCutout (6) | illustration_found, cutout_fallback, pose_fallback, not_found, invalid_sci, sci_to_slug_helper | PNG 200, цепочка lookup, pose-2 → pose-1 fallback, 404, 400 на невалидный sci, slug-конверсия |
-| TestWiki (5) | parus_major, invalid_sci, missing_species, cache_header, ssrf_protection | Реальный Wikipedia ответ 200, 400 на invalid, nulls на несуществующий вид, Cache-Control header, regex SSRF |
-
-### Результат тестирования
-
-```
-cd /home/z/my-project/avian-visitors && python -m pytest avian-visitors/test_api.py -v
-======================== 47 passed in 3.09s =========================
-```
-
-Всего 47 тестов (36 из Части 3 + 11 новых). Все проходят за 3.09 сек.
 
 ---

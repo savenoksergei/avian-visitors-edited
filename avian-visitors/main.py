@@ -29,6 +29,7 @@ main.py — единая точка входа для AvianVisitors Desktop.
 import argparse
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import sys
@@ -54,6 +55,7 @@ DEFAULTS = {
     "confidence": 0.25,
     "sensitivity": 1.0,
     "no_audio": False,
+    "audio_device": None,
     "no_browser": False,
     "log_level": "INFO",
 }
@@ -95,6 +97,16 @@ def _merge_settings(args: argparse.Namespace) -> dict:
         "log_level": os.environ.get("AVIAN_LOG_LEVEL", DEFAULTS["log_level"]).upper(),
     }
 
+    # audio_device: config -> env -> CLI
+    audio_dev_cfg = cfg.get("AUDIO_DEVICE", None)
+    audio_dev_env = os.environ.get("AVIAN_AUDIO_DEVICE", "")
+    if audio_dev_env:
+        settings["audio_device"] = int(audio_dev_env)
+    elif audio_dev_cfg is not None:
+        settings["audio_device"] = int(audio_dev_cfg)
+    else:
+        settings["audio_device"] = None
+
     # CLI overrides
     if args.port is not None:
         settings["port"] = args.port
@@ -106,6 +118,8 @@ def _merge_settings(args: argparse.Namespace) -> dict:
         settings["confidence"] = args.confidence
     if args.sensitivity is not None:
         settings["sensitivity"] = args.sensitivity
+    if args.device is not None:
+        settings["audio_device"] = args.device
     if args.no_audio:
         settings["no_audio"] = True
     if args.no_browser:
@@ -123,6 +137,9 @@ def _apply_env(settings: dict) -> None:
     os.environ["AVIAN_LON"] = str(settings["lon"])
     os.environ["AVIAN_CONFIDENCE"] = str(settings["confidence"])
     os.environ["AVIAN_SENSITIVITY"] = str(settings["sensitivity"])
+
+    if settings.get("audio_device") is not None:
+        os.environ["AVIAN_AUDIO_DEVICE"] = str(settings["audio_device"])
 
     if settings["no_audio"]:
         os.environ["AVIAN_NO_AUDIO"] = "1"
@@ -150,8 +167,11 @@ def _setup_logging(level_name: str) -> None:
     console.setFormatter(fmt_console)
     console.setLevel(level)
 
-    # File handler (append, rotated externally if needed)
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # File handler with rotation: cap at 5 MB per file, keep 3 backups.
+    # Prevents the runaway multi-hundred-MB logs seen during early debugging.
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
     file_handler.setFormatter(fmt_file)
     file_handler.setLevel(level)
 
@@ -185,6 +205,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--lon", type=float, default=None, help="Longitude (default: 37.62)")
     p.add_argument("--confidence", type=float, default=None, help="Min confidence 0-1 (default: 0.25)")
     p.add_argument("--sensitivity", type=float, default=None, help="BirdNET sensitivity (default: 1.0)")
+    p.add_argument("--device", type=int, default=None,
+                    help="Audio device index (default: system default)")
     p.add_argument("--no-audio", action="store_true", help="Disable microphone capture")
     p.add_argument("--no-browser", action="store_true", help="Don't auto-open browser")
     p.add_argument("--log-level", type=str, default=None, choices=["DEBUG", "INFO", "WARNING"],
@@ -215,6 +237,8 @@ def run() -> None:
     log.info("  Location:   %.4f, %.4f", settings["lat"], settings["lon"])
     log.info("  Confidence: %.2f", settings["confidence"])
     log.info("  Sensitivity: %.1f", settings["sensitivity"])
+    log.info("  Device:     %s",
+              settings.get("audio_device", "default (system)"))
     log.info("  Audio:      %s", "disabled" if settings["no_audio"] else "enabled")
     log.info("  Log file:   %s", LOG_FILE)
 
