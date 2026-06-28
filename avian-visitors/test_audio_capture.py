@@ -1,246 +1,448 @@
 """
-test_audio_capture.py — Тест Части 2 без микрофона.
+test_audio_capture.py — Tests for audio_capture.py (birdnet-analyzer backend).
 
-Три уровня тестирования:
-  1. Загрузка модели BirdNET + структура результата
-  2. Inference на тишине и шуме
-  3. Целостный тест _process_segment → Database
-
-Запуск:  python3 test_audio_capture.py
+Tests cover:
+  - _parse_label() — label string parsing
+  - _current_week() — week number calculation
+  - analyze_file() — end-to-end file analysis against known recordings
+  - AudioListener — construction, stats, model loading
+  - Geo-filtering verification
+  - Edge cases (empty audio, short audio, invalid paths)
 """
 
 import os
 import sys
-import time
-import logging
+import tempfile
 import numpy as np
+from datetime import datetime
+from unittest.mock import patch, MagicMock
 
+import pytest
+
+# Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-logging.basicConfig(
-    level=logging.WARNING,  # меньше шума от TF
-    format="%(asctime)s [%(name)s] %(message)s",
-    datefmt="%H:%M:%S",
-)
-
-PASS = 0
-FAIL = 0
+from audio_capture import AudioListener, analyze_file, _current_week
 
 
-def check(name, condition, detail=""):
-    global PASS, FAIL
-    if condition:
-        PASS += 1
-        print(f"  ✅ {name}")
-    else:
-        FAIL += 1
-        print(f"  ❌ {name}  — {detail}")
+# ── _parse_label ──────────────────────────────────────────────────── #
+
+class TestParseLabel:
+    """Tests for the static _parse_label method."""
+
+    def test_standard_label(self):
+        sci, com = AudioListener._parse_label("Parus major_Great Tit")
+        assert sci == "Parus major"
+        assert com == "Great Tit"
+
+    def test_three_word_scientific(self):
+        sci, com = AudioListener._parse_label(
+            "Poecile montanus borealis_Siberian Tit"
+        )
+        assert sci == "Poecile montanus borealis"
+        assert com == "Siberian Tit"
+
+    def test_label_without_underscore(self):
+        sci, com = AudioListener._parse_label("UnknownBird")
+        assert sci == "UnknownBird"
+        assert com == "UnknownBird"
+
+    def test_label_with_hyphen_in_com_name(self):
+        sci, com = AudioListener._parse_label(
+            "Lanius collurio_Red-backed Shrike"
+        )
+        assert sci == "Lanius collurio"
+        assert com == "Red-backed Shrike"
+
+    def test_label_empty_string(self):
+        sci, com = AudioListener._parse_label("")
+        assert sci == ""
+        assert com == ""
+
+    def test_real_birdnet_labels(self):
+        """Test against known BirdNET v2.4 label format."""
+        examples = [
+            ("Passer domesticus_House Sparrow", "Passer domesticus", "House Sparrow"),
+            ("Turdus philomelos_Song Thrush", "Turdus philomelos", "Song Thrush"),
+            ("Columba livia_Rock Pigeon", "Columba livia", "Rock Pigeon"),
+        ]
+        for label, expected_sci, expected_com in examples:
+            sci, com = AudioListener._parse_label(label)
+            assert sci == expected_sci, f"Failed for {label}"
+            assert com == expected_com, f"Failed for {label}"
 
 
-def test_1_model_loading():
-    """Тест 1: Загрузка BirdNET модели и проверка её свойств."""
-    print("\n═══ Тест 1: Загрузка BirdNET модели ═══")
+# ── _current_week ─────────────────────────────────────────────────── #
 
-    from birdnet import load as birdnet_load
+class TestCurrentWeek:
+    def test_returns_int(self):
+        w = _current_week()
+        assert isinstance(w, int)
 
-    t0 = time.time()
-    model = birdnet_load("acoustic", "2.4", "tf")
-    t1 = time.time()
-    print(f"  Модель загружена за {t1 - t0:.1f}с (кэш)")
-
-    check("get_sample_rate() == 48000", model.get_sample_rate() == 48000,
-          f"got {model.get_sample_rate()}")
-    check("get_segment_size_s() == 3.0", model.get_segment_size_s() == 3.0,
-          f"got {model.get_segment_size_s()}")
-    check("get_segment_size_samples() == 144000", model.get_segment_size_samples() == 144000,
-          f"got {model.get_segment_size_samples()}")
-    check("n_species > 6000", model.n_species > 6000, f"got {model.n_species}")
-    check("species_list не пустой", len(model.species_list) > 0)
-
-    first5 = list(model.species_list)[:5]
-    print(f"  Примеры видов: {first5}")
-
-    return model
+    def test_valid_range(self):
+        w = _current_week()
+        assert 1 <= w <= 53
 
 
-def test_2_inference_on_silence(model):
-    """Тест 2: Inference на тишине — не должно быть детекций > 0.25."""
-    print("\n═══ Тест 2: Inference на тишине ═══")
+# ── AudioListener construction ────────────────────────────────────── #
 
-    silence = np.zeros(48000 * 3, dtype=np.float32)
-    t0 = time.time()
-    result = model.predict_arrays(
-        (silence, 48000),
-        top_k=None,
-        default_confidence_threshold=0.0,
-    )
-    t1 = time.time()
-    print(f"  Inference за {t1 - t0:.2f}с")
+class TestAudioListenerConstruction:
+    def test_default_params(self):
+        db = MagicMock()
+        listener = AudioListener(db)
+        assert listener.sample_rate == 48_000
+        assert listener.segment_duration == 3.0
+        assert listener.segment_samples == 144_000
+        assert listener.confidence_threshold == 0.25
+        assert listener.latitude == 55.75
+        assert listener.longitude == 37.62
+        assert listener.sensitivity == 1.0
+        assert listener.is_running is False
 
-    check("species_probs shape == (1,1,N)", result.species_probs.shape[0] == 1
-          and result.species_probs.shape[1] == 1,
-          f"got {result.species_probs.shape}")
-    check("species_list len == n_species", len(result.species_list) > 6000)
+    def test_custom_params(self):
+        db = MagicMock()
+        listener = AudioListener(
+            db,
+            sample_rate=44100,
+            segment_duration=3.0,
+            confidence_threshold=0.5,
+            latitude=40.71,
+            longitude=-74.00,
+            week=15,
+        )
+        assert listener.sample_rate == 44100
+        assert listener.segment_samples == 132_300
+        assert listener.confidence_threshold == 0.5
+        assert listener.latitude == 40.71
+        assert listener.longitude == -74.00
+        assert listener.week == 15
 
-    probs = result.species_probs[0, 0]
-    max_conf = float(np.max(probs))
-    print(f"  max confidence на тишине: {max_conf:.6f}")
-    check("Тишина: max_conf < 0.1", max_conf < 0.1, f"got {max_conf:.4f}")
+    def test_stats_initial(self):
+        db = MagicMock()
+        listener = AudioListener(db)
+        s = listener.stats
+        assert s["segments_processed"] == 0
+        assert s["detections_written"] == 0
+        assert s["uptime_seconds"] == 0
 
-    above_001 = int(np.sum(probs > 0.01))
-    print(f"  Видов с conf > 0.01: {above_001}")
-
-    return result
-
-
-def test_3_inference_on_noise(model):
-    """Тест 3: Inference на белом шуме — проверяем что код не падает."""
-    print("\n═══ Тест 3: Inference на белом шуме ═══")
-
-    rng = np.random.default_rng(42)
-    noise = rng.normal(0, 0.1, size=48000 * 3).astype(np.float32)
-    t0 = time.time()
-    result = model.predict_arrays(
-        (noise, 48000),
-        top_k=None,
-        default_confidence_threshold=0.0,
-    )
-    t1 = time.time()
-    print(f"  Inference за {t1 - t0:.2f}с")
-
-    probs = result.species_probs[0, 0]
-    max_conf = float(np.max(probs))
-    above_25 = int(np.sum(probs > 0.25))
-    above_01 = int(np.sum(probs > 0.01))
-    print(f"  max confidence: {max_conf:.6f}")
-    print(f"  Видов с conf > 0.25: {above_25}")
-    print(f"  Видов с conf > 0.01: {above_01}")
-
-    top5_idx = np.argsort(probs)[-5:][::-1]
-    print("  Топ-5 на шуме:")
-    for idx in top5_idx:
-        print(f"    {probs[idx]:.4f}  {result.species_list[idx]}")
-
-    return result
+    def test_stop_when_not_running(self):
+        db = MagicMock()
+        listener = AudioListener(db)
+        listener.stop()  # Should not raise
+        assert listener.is_running is False
 
 
-def test_4_process_segment_to_db():
-    """Тест 4: _process_segment() → запись в БД."""
-    print("\n═══ Тест 4: _process_segment → Database ═══")
+# ── AudioListener _ensure_model ───────────────────────────────────── #
 
-    from database import Database
-    from audio_capture import AudioListener
+class TestEnsureModel:
+    def test_model_loads(self):
+        """Test that _ensure_model can load birdnet-analyzer model."""
+        db = MagicMock()
+        listener = AudioListener(
+            db,
+            latitude=55.75,
+            longitude=37.62,
+            week=26,
+        )
+        # This will actually load the model (takes a few seconds)
+        listener._ensure_model()
 
-    test_db = "/tmp/test_audio_capture.db"
-    if os.path.exists(test_db):
-        os.remove(test_db)
+        assert listener._model_loaded is True
+        assert len(listener._labels) == 6522
+        assert isinstance(listener._species_list, list)
+        assert len(listener._species_list) > 0  # Moscow should have species
+        print(f"  Labels: {len(listener._labels)}, Species list: {len(listener._species_list)}")
 
-    db = Database(db_path=test_db)
-    db.init()
+    def test_model_loads_once(self):
+        """Model should only load once (second call is a no-op)."""
+        db = MagicMock()
+        listener = AudioListener(db)
+        listener._ensure_model()
+        labels_len = len(listener._labels)
+        listener._ensure_model()  # Should skip
+        assert len(listener._labels) == labels_len
 
-    listener = AudioListener(db, confidence_threshold=0.25)
-
-    # 4a: Тишина — не должно быть записей
-    silence = np.zeros(48000 * 3, dtype=np.float32)
-    t0 = time.time()
-    listener._process_segment(silence)
-    t1 = time.time()
-    print(f"  Тишина обработана за {t1 - t0:.2f}с")
-
-    check("segments_processed >= 1", listener._segments_processed >= 1)
-    stats = db.stats()
-    check("Тишина: 0 детекций", stats["totals"]["detections"] == 0,
-          f"got {stats['totals']['detections']}")
-
-    # 4b: Белый шум — может быть детекции (шум может триггерить модель)
-    rng = np.random.default_rng(42)
-    noise = rng.normal(0, 0.1, size=48000 * 3).astype(np.float32)
-    listener._process_segment(noise)
-
-    stats2 = db.stats()
-    print(f"  После шума: {stats2['totals']['detections']} детекций, "
-          f"{stats2['totals']['species']} видов")
-
-    if stats2["totals"]["detections"] > 0:
-        check("Шум дал детекции (возможно)", True)
-        # Проверяем структуру записей
-        ll = db.lifelist()
-        sp = ll["species"][0]
-        check("lifelist[0] имеет 'sci'", "sci" in sp)
-        check("lifelist[0] имеет 'com'", "com" in sp)
-        check("lifelist[0] имеет 'first_seen'", "first_seen" in sp)
-        check("lifelist[0] имеет 'best_conf'", "best_conf" in sp)
-        check("best_conf > 0.25", sp["best_conf"] > 0.25,
-              f"got {sp['best_conf']:.4f}")
-        # Проверяем, что sci_name и com_name корректно разделены
-        check("sci_name не содержит '_'", "_" not in sp["sci"],
-              f"got '{sp['sci']}'")
-        check("com_name ≠ sci_name", sp["com"] != sp["sci"],
-              f"com='{sp['com']}', sci='{sp['sci']}'")
-        print(f"  Топ вид: {sp['sci']} / {sp['com']} (conf={sp['best_conf']:.3f})")
-    else:
-        print("  ⚠️  Шум не дал детекций > 0.25 — это нормально")
-
-    # 4c: Модель загружена лениво
-    check("Модель загружена", listener._model is not None)
-
-    db.close()
-    os.remove(test_db)
+    def test_no_geo_filter(self):
+        """Without valid coordinates, all species should be used."""
+        db = MagicMock()
+        listener = AudioListener(db, latitude=-1, longitude=-1)
+        listener._ensure_model()
+        assert listener._model_loaded is True
+        # No geo-filter → species list is empty (means "use all")
+        assert len(listener._species_list) == 0
 
 
-def test_5_lifecycle():
-    """Тест 5: API AudioListener без микрофона."""
-    print("\n═══ Тест 5: Жизненный цикл ═══")
+# ── analyze_file — real recordings ────────────────────────────────── #
 
-    from database import Database
-    from audio_capture import AudioListener
+class TestAnalyzeFileReal:
+    """
+    End-to-end tests against real audio recordings.
+    These verify that birdnet-analyzer produces CORRECT results.
+    """
 
-    test_db = "/tmp/test_lifecycle.db"
-    if os.path.exists(test_db):
-        os.remove(test_db)
+    @pytest.fixture
+    def db(self):
+        """Create a temporary in-memory database for each test."""
+        from database import Database
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            db = Database(db_path=db_path)
+            db.init()
+            yield db
+            db.close()
 
-    db = Database(db_path=test_db)
-    db.init()
-    listener = AudioListener(db)
+    @pytest.fixture
+    def sparrow_wav(self):
+        """Path to the Wikipedia House Sparrow test file."""
+        path = "/home/z/my-project/upload/sparrow_test.wav"
+        if os.path.exists(path):
+            yield path
+        else:
+            pytest.skip("sparrow_test.wav not found")
 
-    check("is_running == False", not listener.is_running)
-    check("stats: segments == 0", listener.stats["segments_processed"] == 0)
-    check("stats: detections == 0", listener.stats["detections_written"] == 0)
+    def test_sparrow_detection(self, db, sparrow_wav):
+        """
+        Wikipedia House Sparrow recording should detect House Sparrow
+        as the top species with high confidence.
+        """
+        # Clean DB
+        db._get_conn().execute("DELETE FROM detections")
+        db._get_conn().commit()
 
-    # stop() на не запущенном — не должен крашиться
-    listener.stop()
-    check("stop() на не запущенном — без ошибки", True)
+        result = analyze_file(
+            sparrow_wav,
+            db,
+            confidence_threshold=0.25,
+            latitude=55.75,
+            longitude=37.62,
+            week=26,
+        )
 
-    db.close()
-    os.remove(test_db)
+        assert result["segments_analyzed"] > 0
+        assert result["detections_written"] > 0
+
+        # Check that House Sparrow is in the top detections
+        top = result["top_detections"]
+        top_species = [d["sci_name"] for d in top]
+        assert "Passer domesticus" in top_species, (
+            f"House Sparrow not found in top detections: {top_species[:5]}"
+        )
+
+        # Verify it's in the database
+        stats = db.stats()
+        assert stats["totals"]["detections"] > 0
+
+        # Print top 5 for debugging
+        print("\n  Top detections for House Sparrow recording:")
+        for d in top[:5]:
+            print(f"    {d['confidence']:.3f}  {d['sci_name']}  ({d['com_name']})")
+
+    def test_user_birdybird(self, db):
+        """User's first recording (birdybird.m4a) — should detect Great Tit."""
+        path = "/home/z/my-project/upload/birdybird.m4a"
+        if not os.path.exists(path):
+            pytest.skip("birdybird.m4a not found")
+
+        db._get_conn().execute("DELETE FROM detections")
+        db._get_conn().commit()
+
+        result = analyze_file(
+            path,
+            db,
+            confidence_threshold=0.25,
+            latitude=55.75,
+            longitude=37.62,
+            week=26,
+        )
+
+        top = result["top_detections"]
+        top_species = [d["sci_name"] for d in top]
+        assert "Parus major" in top_species, (
+            f"Great Tit not found in top detections: {top_species[:5]}"
+        )
+
+        print("\n  Top detections for birdybird.m4a:")
+        for d in top[:5]:
+            print(f"    {d['confidence']:.3f}  {d['sci_name']}  ({d['com_name']})")
+
+    def test_user_birdybird2(self, db):
+        """User's second recording (birdybird2.m4a) — Thrush Nightingale."""
+        path = "/home/z/my-project/upload/birdybird2.m4a"
+        if not os.path.exists(path):
+            pytest.skip("birdybird2.m4a not found")
+
+        db._get_conn().execute("DELETE FROM detections")
+        db._get_conn().commit()
+
+        result = analyze_file(
+            path,
+            db,
+            confidence_threshold=0.1,
+            latitude=55.75,
+            longitude=37.62,
+            week=26,
+        )
+
+        top = result["top_detections"]
+        top_species = [d["sci_name"] for d in top]
+        # Thrush Nightingale should be among top detections
+        assert "Luscinia luscinia" in top_species, (
+            f"Thrush Nightingale not found in top: {top_species[:5]}"
+        )
+
+        print("\n  Top detections for birdybird2.m4a:")
+        for d in top[:5]:
+            print(f"    {d['confidence']:.3f}  {d['sci_name']}  ({d['com_name']})")
 
 
-def main():
-    global PASS, FAIL
-    print("=" * 60)
-    print("  Тестирование audio_capture.py (Часть 2)")
-    print("=" * 60)
+# ── Edge cases ────────────────────────────────────────────────────── #
 
-    model = None
-    try:
-        model = test_1_model_loading()
-        test_2_inference_on_silence(model)
-        test_3_inference_on_noise(model)
-        test_4_process_segment_to_db()
-        test_5_lifecycle()
-    except Exception as e:
-        import traceback
-        print(f"\n💥 ОШИБКА: {e}")
-        traceback.print_exc()
-        FAIL += 1  # noqa: FAIL is global
+class TestEdgeCases:
+    def test_analyze_nonexistent_file(self):
+        db = MagicMock()
+        with pytest.raises(Exception):
+            analyze_file(
+                "/nonexistent/path/audio.wav",
+                db,
+                latitude=55.75,
+                longitude=37.62,
+            )
 
-    print("\n" + "=" * 60)
-    print(f"  Результат: {PASS} ✅  {FAIL} ❌")
-    print("=" * 60)
+    def test_silence_segment(self):
+        """
+        A segment of silence should produce no detections above threshold.
+        We test this by creating a numpy array of zeros and verifying
+        the inference pipeline handles it.
+        """
+        db = MagicMock()
+        listener = AudioListener(db, confidence_threshold=0.25)
+        listener._ensure_model()
 
-    if FAIL > 0:
-        sys.exit(1)
+        # Create silence
+        silence = np.zeros(144_000, dtype="float32")
+        listener._process_segment(silence)
+
+        # No insertions should have been called
+        assert not db.insert_detection.called, (
+            "Silence should not produce detections"
+        )
+
+    def test_short_segment_padded(self):
+        """
+        A segment shorter than 3s should be padded and not crash.
+        """
+        db = MagicMock()
+        listener = AudioListener(db, confidence_threshold=0.01)
+        listener._ensure_model()
+
+        # 1 second of audio
+        short_audio = np.random.randn(48_000).astype("float32") * 0.01
+        listener._process_segment(short_audio)
+
+        # Should not crash — we just verify no exception
+
+
+# ── Geo-filtering ─────────────────────────────────────────────────── #
+
+class TestGeoFiltering:
+    def test_moscow_has_species(self):
+        """Moscow should have a reasonable species list."""
+        db = MagicMock()
+        listener = AudioListener(
+            db,
+            latitude=55.75,
+            longitude=37.62,
+            week=26,
+        )
+        listener._ensure_model()
+        # Moscow in summer should have hundreds of species
+        assert len(listener._species_list) > 100
+        # Great Tit should be in Moscow's species list
+        assert "Parus major_Great Tit" in listener._species_list
+
+    def test_different_weeks(self):
+        """Different weeks might give slightly different species lists."""
+        db = MagicMock()
+        listener26 = AudioListener(db, latitude=55.75, longitude=37.62, week=26)
+        listener26._ensure_model()
+        list26 = set(listener26._species_list)
+
+        listener1 = AudioListener(db, latitude=55.75, longitude=37.62, week=1)
+        listener1._ensure_model()
+        list1 = set(listener1._species_list)
+
+        # Lists should differ (winter vs summer species)
+        # Both should still have common resident species like Great Tit
+        great_tit = "Parus major_Great Tit"
+        assert great_tit in list26
+        assert great_tit in list1
+        # But they shouldn't be identical (migratory species differ)
+        # We can't assert strict inequality since it depends on threshold,
+        # but we can check sizes are reasonable
+        assert len(list26) > 50
+        assert len(list1) > 50
+
+
+# ── Confidence threshold ──────────────────────────────────────────── #
+
+class TestConfidenceThreshold:
+    def test_higher_threshold_fewer_detections(self, sparrow_wav_fixture=None):
+        """
+        Higher confidence threshold should produce fewer or equal detections.
+        """
+        # Only run if sparrow file exists
+        path = "/home/z/my-project/upload/sparrow_test.wav"
+        if not os.path.exists(path):
+            pytest.skip("sparrow_test.wav not found")
+
+        from database import Database
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db1 = Database(db_path=os.path.join(tmpdir, "test1.db"))
+            db1.init()
+            r1 = analyze_file(path, db1, confidence_threshold=0.5,
+                            latitude=55.75, longitude=37.62, week=26)
+
+            db2 = Database(db_path=os.path.join(tmpdir, "test2.db"))
+            db2.init()
+            r2 = analyze_file(path, db2, confidence_threshold=0.01,
+                            latitude=55.75, longitude=37.62, week=26)
+
+            assert r1["detections_written"] <= r2["detections_written"]
+            db1.close()
+            db2.close()
+
+
+# ── Database integration ──────────────────────────────────────────── #
+
+class TestDatabaseIntegration:
+    def test_detections_written_to_db(self):
+        """Verify detections are actually written to the database."""
+        path = "/home/z/my-project/upload/sparrow_test.wav"
+        if not os.path.exists(path):
+            pytest.skip("sparrow_test.wav not found")
+
+        from database import Database
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = Database(db_path=os.path.join(tmpdir, "test.db"))
+            db.init()
+
+            result = analyze_file(
+                path, db,
+                confidence_threshold=0.25,
+                latitude=55.75, longitude=37.62, week=26,
+            )
+
+            stats = db.stats()
+            assert stats["totals"]["detections"] == result["detections_written"]
+            assert stats["totals"]["species"] > 0
+
+            # Check lifelist includes House Sparrow
+            lifelist = db.lifelist()
+            species_sci = [s["sci"] for s in lifelist["species"]]
+            assert "Passer domesticus" in species_sci
+
+            db.close()
 
 
 if __name__ == "__main__":
-    main()
+    pytest.main([__file__, "-v", "-s"])

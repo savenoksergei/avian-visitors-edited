@@ -1,0 +1,725 @@
+     1→     1→"""Module to analyze audio samples."""
+     2→     2→
+     3→     3→import datetime
+     4→     4→import json
+     5→     5→import operator
+     6→     6→import os
+     7→     7→from collections.abc import Sequence
+     8→     8→
+     9→     9→import numpy as np
+    10→    10→
+    11→    11→import birdnet_analyzer.config as cfg
+    12→    12→from birdnet_analyzer import audio, model, utils
+    13→    13→
+    14→    14→RAVEN_TABLE_HEADER = (
+    15→    15→    "Selection\tView\tChannel\tBegin Time (s)\tEnd Time (s)\tLow Freq (Hz)\tHigh Freq (Hz)\tCommon Name\tSpecies Code\tConfidence\tBegin Path\tFile Offset (s)\n"
+    16→    16→)
+    17→    17→KALEIDOSCOPE_HEADER = "INDIR,FOLDER,IN FILE,OFFSET,DURATION,scientific_name,common_name,confidence,lat,lon,week,overlap,sensitivity\n"
+    18→    18→CSV_HEADER = "Start (s),End (s),Scientific name,Common name,Confidence,File\n"
+    19→    19→SCRIPT_DIR = os.path.abspath(os.path.dirname(__file__))
+    20→    20→
+    21→    21→
+    22→    22→def save_analysis_params(path):
+    23→    23→    utils.save_params(
+    24→    24→        path,
+    25→    25→        (
+    26→    26→            "File splitting duration",
+    27→    27→            "Segment length",
+    28→    28→            "Sample rate",
+    29→    29→            "Segment overlap",
+    30→    30→            "Minimum Segment length",
+    31→    31→            "Bandpass filter minimum",
+    32→    32→            "Bandpass filter maximum",
+    33→    33→            "Merge consecutive detections",
+    34→    34→            "Audio speed",
+    35→    35→            "Custom classifier path",
+    36→    36→        ),
+    37→    37→        (
+    38→    38→            cfg.FILE_SPLITTING_DURATION,
+    39→    39→            cfg.SIG_LENGTH,
+    40→    40→            cfg.SAMPLE_RATE,
+    41→    41→            cfg.SIG_OVERLAP,
+    42→    42→            cfg.SIG_MINLEN,
+    43→    43→            cfg.BANDPASS_FMIN,
+    44→    44→            cfg.BANDPASS_FMAX,
+    45→    45→            cfg.MERGE_CONSECUTIVE,
+    46→    46→            cfg.AUDIO_SPEED,
+    47→    47→            cfg.CUSTOM_CLASSIFIER,
+    48→    48→        ),
+    49→    49→    )
+    50→    50→
+    51→    51→
+    52→    52→def load_codes():
+    53→    53→    """Loads the eBird codes.
+    54→    54→
+    55→    55→    Returns:
+    56→    56→        A dictionary containing the eBird codes.
+    57→    57→    """
+    58→    58→    with open(os.path.join(SCRIPT_DIR, cfg.CODES_FILE), encoding="utf-8") as cfile:
+    59→    59→        return json.load(cfile)
+    60→    60→
+    61→    61→
+    62→    62→def generate_raven_table(timestamps: list[str], result: dict[str, list], afile_path: str, result_path: str):
+    63→    63→    """
+    64→    64→    Generates a Raven selection table from the given timestamps and prediction results.
+    65→    65→
+    66→    66→    Args:
+    67→    67→        timestamps (list[str]): List of timestamp strings in the format "start-end".
+    68→    68→        result (dict[str, list]): Dictionary where keys are timestamp strings and values are lists of predictions.
+    69→    69→        afile_path (str): Path to the audio file being analyzed.
+    70→    70→        result_path (str): Path where the resulting Raven selection table will be saved.
+    71→    71→
+    72→    72→    Returns:
+    73→    73→        None
+    74→    74→    """
+    75→    75→    selection_id = 0
+    76→    76→    out_string = RAVEN_TABLE_HEADER
+    77→    77→
+    78→    78→    # Read native sample rate
+    79→    79→    high_freq = audio.get_sample_rate(afile_path) / 2
+    80→    80→
+    81→    81→    high_freq = min(high_freq, int(cfg.SIG_FMAX / cfg.AUDIO_SPEED))
+    82→    82→
+    83→    83→    high_freq = int(min(high_freq, int(cfg.BANDPASS_FMAX / cfg.AUDIO_SPEED)))
+    84→    84→    low_freq = max(cfg.SIG_FMIN, int(cfg.BANDPASS_FMIN / cfg.AUDIO_SPEED))
+    85→    85→
+    86→    86→    # Extract valid predictions for every timestamp
+    87→    87→    for timestamp in timestamps:
+    88→    88→        rstring = ""
+    89→    89→        start, end = timestamp.split("-", 1)
+    90→    90→
+    91→    91→        for c in result[timestamp]:
+    92→    92→            selection_id += 1
+    93→    93→            label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
+    94→    94→            code = cfg.CODES[c[0]] if c[0] in cfg.CODES else c[0]
+    95→    95→            lbl = label if cfg.USE_PERCH else label.split("_", 1)[-1]
+    96→    96→            rstring += f"{selection_id}\tSpectrogram 1\t1\t{start}\t{end}\t{low_freq}\t{high_freq}\t{lbl}\t{code}\t{c[1]:.4f}\t{afile_path}\t{start}\n"
+    97→    97→
+    98→    98→        # Write result string to file
+    99→    99→        out_string += rstring
+   100→   100→
+   101→   101→    # If we don't have any valid predictions, we still need to add a line to the selection table
+   102→   102→    # in case we want to combine results
+   103→   103→    if len(out_string) == len(RAVEN_TABLE_HEADER) and cfg.OUTPUT_PATH is not None:
+   104→   104→        selection_id += 1
+   105→   105→        out_string += f"{selection_id}\tSpectrogram 1\t1\t0\t3\t{low_freq}\t{high_freq}\tnocall\tnocall\t1.0\t{afile_path}\t0\n"
+   106→   106→
+   107→   107→    utils.save_result_file(result_path, out_string)
+   108→   108→
+   109→   109→
+   110→   110→def generate_audacity(timestamps: list[str], result: dict[str, list], result_path: str):
+   111→   111→    """
+   112→   112→    Generates an Audacity timeline label file from the given timestamps and results.
+   113→   113→
+   114→   114→    Args:
+   115→   115→        timestamps (list[str]): A list of timestamp strings.
+   116→   116→        result (dict[str, list]): A dictionary where keys are timestamps and values are lists of tuples,
+   117→   117→                                  each containing a label and a confidence score.
+   118→   118→        result_path (str): The file path where the result string will be saved.
+   119→   119→
+   120→   120→    Returns:
+   121→   121→        None
+   122→   122→    """
+   123→   123→    out_string = ""
+   124→   124→
+   125→   125→    # Audacity timeline labels
+   126→   126→    for timestamp in timestamps:
+   127→   127→        rstring = ""
+   128→   128→
+   129→   129→        for c in result[timestamp]:
+   130→   130→            label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
+   131→   131→            ts = timestamp.replace("-", "\t")
+   132→   132→            lbl = label if cfg.USE_PERCH else label.replace("_", ", ")
+   133→   133→            rstring += f"{ts}\t{lbl}\t{c[1]:.4f}\n"
+   134→   134→
+   135→   135→        # Write result string to file
+   136→   136→        out_string += rstring
+   137→   137→
+   138→   138→    utils.save_result_file(result_path, out_string)
+   139→   139→
+   140→   140→
+   141→   141→def generate_kaleidoscope(timestamps: list[str], result: dict[str, list], afile_path: str, result_path: str):
+   142→   142→    """
+   143→   143→    Generates a Kaleidoscope-compatible CSV string from the given timestamps and results, and saves it to a file.
+   144→   144→
+   145→   145→    Args:
+   146→   146→        timestamps (list[str]): List of timestamp strings in the format "start-end".
+   147→   147→        result (dict[str, list]): Dictionary where keys are timestamp strings and values are lists of tuples containing
+   148→   148→                                  species label and confidence score.
+   149→   149→        afile_path (str): Path to the audio file being analyzed.
+   150→   150→        result_path (str): Path where the resulting CSV file will be saved.
+   151→   151→
+   152→   152→    Returns:
+   153→   153→        None
+   154→   154→    """
+   155→   155→    out_string = KALEIDOSCOPE_HEADER
+   156→   156→
+   157→   157→    folder_path, filename = os.path.split(afile_path)
+   158→   158→    parent_folder, folder_name = os.path.split(folder_path)
+   159→   159→
+   160→   160→    for timestamp in timestamps:
+   161→   161→        rstring = ""
+   162→   162→        start, end = timestamp.split("-", 1)
+   163→   163→
+   164→   164→        for c in result[timestamp]:
+   165→   165→            label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
+   166→   166→
+   167→   167→            if cfg.USE_PERCH:
+   168→   168→                common = scientific = label
+   169→   169→            else:
+   170→   170→                split_label = label.split("_", 1)
+   171→   171→                scientific, common = split_label[0], split_label[-1]
+   172→   172→
+   173→   173→            rstring += "{},{},{},{},{},{},{},{:.4f},{:.4f},{:.4f},{},{},{}\n".format(
+   174→   174→                parent_folder.rstrip("/"),
+   175→   175→                folder_name,
+   176→   176→                filename,
+   177→   177→                start,
+   178→   178→                float(end) - float(start),
+   179→   179→                scientific,
+   180→   180→                common,
+   181→   181→                c[1],
+   182→   182→                cfg.LATITUDE,
+   183→   183→                cfg.LONGITUDE,
+   184→   184→                cfg.WEEK,
+   185→   185→                cfg.SIG_OVERLAP,
+   186→   186→                cfg.SIGMOID_SENSITIVITY,
+   187→   187→            )
+   188→   188→
+   189→   189→        # Write result string to file
+   190→   190→        out_string += rstring
+   191→   191→
+   192→   192→    utils.save_result_file(result_path, out_string)
+   193→   193→
+   194→   194→
+   195→   195→def generate_csv(timestamps: list[str], result: dict[str, list], afile_path: str, result_path: str):
+   196→   196→    """
+   197→   197→    Generates a CSV file from the given timestamps and results.
+   198→   198→
+   199→   199→    Args:
+   200→   200→        timestamps (list[str]): A list of timestamp strings in the format "start-end".
+   201→   201→        result (dict[str, list]): A dictionary where keys are timestamp strings and values are lists of tuples.
+   202→   202→                                  Each tuple contains a label and a confidence score.
+   203→   203→        afile_path (str): The file path of the audio file being analyzed.
+   204→   204→        result_path (str): The file path where the resulting CSV file will be saved.
+   205→   205→
+   206→   206→    Returns:
+   207→   207→        None
+   208→   208→    """
+   209→   209→    from birdnet_analyzer.analyze import POSSIBLE_ADDITIONAL_COLUMNS_MAP
+   210→   210→
+   211→   211→    out_string = CSV_HEADER
+   212→   212→    columns_map = {}
+   213→   213→
+   214→   214→    if cfg.ADDITIONAL_COLUMNS:
+   215→   215→        for col in POSSIBLE_ADDITIONAL_COLUMNS_MAP:
+   216→   216→            if col in cfg.ADDITIONAL_COLUMNS:
+   217→   217→                columns_map[col] = POSSIBLE_ADDITIONAL_COLUMNS_MAP[col]()
+   218→   218→
+   219→   219→        if columns_map:
+   220→   220→            out_string = out_string[:-1] + "," + ",".join(columns_map) + "\n"
+   221→   221→
+   222→   222→    for timestamp in timestamps:
+   223→   223→        rstring = ""
+   224→   224→
+   225→   225→        for c in result[timestamp]:
+   226→   226→            start, end = timestamp.split("-", 1)
+   227→   227→            label = cfg.TRANSLATED_LABELS[cfg.LABELS.index(c[0])] if cfg.TRANSLATED_LABELS else c[0]
+   228→   228→
+   229→   229→            if cfg.USE_PERCH:
+   230→   230→                common = scientific = label
+   231→   231→            else:
+   232→   232→                split_label = label.split("_", 1)
+   233→   233→                scientific, common = split_label[0], split_label[-1]
+   234→   234→
+   235→   235→            rstring += f"{start},{end},{scientific},{common},{c[1]:.4f},{afile_path}"
+   236→   236→
+   237→   237→            if columns_map:
+   238→   238→                rstring += "," + ",".join(str(val) for val in columns_map.values())
+   239→   239→
+   240→   240→            rstring += "\n"
+   241→   241→
+   242→   242→        # Write result string to file
+   243→   243→        out_string += rstring
+   244→   244→
+   245→   245→    utils.save_result_file(result_path, out_string)
+   246→   246→
+   247→   247→
+   248→   248→def save_result_files(r: dict[str, list], result_files: dict[str, str], afile_path: str):
+   249→   249→    """
+   250→   250→    Saves the result files in various formats based on the provided configuration.
+   251→   251→
+   252→   252→    Args:
+   253→   253→        r (dict[str, list]): A dictionary containing the analysis results with timestamps as keys.
+   254→   254→        result_files (dict[str, str]): A dictionary mapping result types to their respective file paths.
+   255→   255→        afile_path (str): The path to the audio file being analyzed.
+   256→   256→
+   257→   257→    Returns:
+   258→   258→        None
+   259→   259→    """
+   260→   260→
+   261→   261→    os.makedirs(cfg.OUTPUT_PATH, exist_ok=True)
+   262→   262→
+   263→   263→    # Merge consecutive detections of the same species
+   264→   264→    r_merged = merge_consecutive_detections(r, cfg.MERGE_CONSECUTIVE)
+   265→   265→
+   266→   266→    # Selection table
+   267→   267→    timestamps = get_sorted_timestamps(r_merged)
+   268→   268→
+   269→   269→    if "table" in result_files:
+   270→   270→        generate_raven_table(timestamps, r_merged, afile_path, result_files["table"])
+   271→   271→
+   272→   272→    if "audacity" in cfg.RESULT_TYPES:
+   273→   273→        generate_audacity(timestamps, r_merged, result_files["audacity"])
+   274→   274→
+   275→   275→    # if "r" in cfg.RESULT_TYPES:
+   276→   276→    #     generate_rtable(timestamps, r, afile_path, result_files["r"])
+   277→   277→
+   278→   278→    if "kaleidoscope" in cfg.RESULT_TYPES:
+   279→   279→        generate_kaleidoscope(timestamps, r_merged, afile_path, result_files["kaleidoscope"])
+   280→   280→
+   281→   281→    if "csv" in cfg.RESULT_TYPES:
+   282→   282→        generate_csv(timestamps, r_merged, afile_path, result_files["csv"])
+   283→   283→
+   284→   284→
+   285→   285→def combine_raven_tables(saved_results: list[str]):
+   286→   286→    """
+   287→   287→    Combines multiple Raven selection table files into a single file and adjusts the selection IDs and times.
+   288→   288→
+   289→   289→    Args:
+   290→   290→        saved_results (list[str]): List of file paths to the Raven selection table files to be combined.
+   291→   291→
+   292→   292→    Returns:
+   293→   293→        None
+   294→   294→    """
+   295→   295→    # Combine all files
+   296→   296→    s_id = 1
+   297→   297→    time_offset = 0
+   298→   298→    audiofiles = []
+   299→   299→
+   300→   300→    with open(os.path.join(cfg.OUTPUT_PATH, cfg.OUTPUT_RAVEN_FILENAME), "w", encoding="utf-8") as f:
+   301→   301→        f.write(RAVEN_TABLE_HEADER)
+   302→   302→
+   303→   303→        for rfile in saved_results:
+   304→   304→            if not rfile:
+   305→   305→                continue
+   306→   306→            with open(rfile, encoding="utf-8") as rf:
+   307→   307→                try:
+   308→   308→                    lines = rf.readlines()
+   309→   309→
+   310→   310→                    # make sure it's a selection table
+   311→   311→                    if "Selection" not in lines[0] or "File Offset" not in lines[0]:
+   312→   312→                        continue
+   313→   313→
+   314→   314→                    # skip header and add to file
+   315→   315→                    f_name = lines[1].split("\t")[10]
+   316→   316→                    f_duration = audio.get_audio_file_length(f_name)
+   317→   317→
+   318→   318→                    audiofiles.append(f_name)
+   319→   319→
+   320→   320→                    for line in lines[1:]:
+   321→   321→                        # empty line?
+   322→   322→                        if not line.strip():
+   323→   323→                            continue
+   324→   324→
+   325→   325→                        # Is species code and common name == 'nocall'?
+   326→   326→                        # If so, that's a dummy line and we can skip it
+   327→   327→                        if line.split("\t")[7] == "nocall" and line.split("\t")[8] == "nocall":
+   328→   328→                            continue
+   329→   329→
+   330→   330→                        # adjust selection id
+   331→   331→                        line_elements = line.split("\t")
+   332→   332→                        line_elements[0] = str(s_id)
+   333→   333→                        s_id += 1
+   334→   334→
+   335→   335→                        # adjust time
+   336→   336→                        line_elements[3] = str(float(line_elements[3]) + time_offset)
+   337→   337→                        line_elements[4] = str(float(line_elements[4]) + time_offset)
+   338→   338→
+   339→   339→                        # write line
+   340→   340→                        f.write("\t".join(line_elements))
+   341→   341→
+   342→   342→                    # adjust time offset
+   343→   343→                    time_offset += f_duration
+   344→   344→
+   345→   345→                except Exception as ex:
+   346→   346→                    print(f"Error: Cannot combine results from {rfile}.\n", flush=True)
+   347→   347→                    utils.write_error_log(ex)
+   348→   348→
+   349→   349→    listfilesname = cfg.OUTPUT_RAVEN_FILENAME.rsplit(".", 1)[0] + ".list.txt"
+   350→   350→
+   351→   351→    with open(os.path.join(cfg.OUTPUT_PATH, listfilesname), "w", encoding="utf-8") as f:
+   352→   352→        f.writelines(f + "\n" for f in audiofiles)
+   353→   353→
+   354→   354→
+   355→   355→def combine_kaleidoscope_files(saved_results: list[str]):
+   356→   356→    """
+   357→   357→    Combines multiple Kaleidoscope result files into a single file.
+   358→   358→
+   359→   359→    Args:
+   360→   360→        saved_results (list[str]): A list of file paths to the saved Kaleidoscope result files.
+   361→   361→
+   362→   362→    Returns:
+   363→   363→        None
+   364→   364→    """
+   365→   365→    # Combine all files
+   366→   366→    with open(
+   367→   367→        os.path.join(cfg.OUTPUT_PATH, cfg.OUTPUT_KALEIDOSCOPE_FILENAME),
+   368→   368→        "w",
+   369→   369→        encoding="utf-8",
+   370→   370→    ) as f:
+   371→   371→        f.write(KALEIDOSCOPE_HEADER)
+   372→   372→
+   373→   373→        for rfile in saved_results:
+   374→   374→            with open(rfile, encoding="utf-8") as rf:
+   375→   375→                try:
+   376→   376→                    lines = rf.readlines()
+   377→   377→
+   378→   378→                    # make sure it's a selection table
+   379→   379→                    if "INDIR" not in lines[0] or "sensitivity" not in lines[0]:
+   380→   380→                        continue
+   381→   381→
+   382→   382→                    # skip header and add to file
+   383→   383→                    f.writelines(lines[1:])
+   384→   384→
+   385→   385→                except Exception as ex:
+   386→   386→                    print(f"Error: Cannot combine results from {rfile}.\n", flush=True)
+   387→   387→                    utils.write_error_log(ex)
+   388→   388→
+   389→   389→
+   390→   390→def combine_csv_files(saved_results: list[str]):
+   391→   391→    """
+   392→   392→    Combines multiple CSV files into a single CSV file.
+   393→   393→
+   394→   394→    Args:
+   395→   395→        saved_results (list[str]): A list of file paths to the CSV files to be combined.
+   396→   396→    """
+   397→   397→    out_string = ""
+   398→   398→
+   399→   399→    for rfile in saved_results:
+   400→   400→        try:
+   401→   401→            with open(rfile, encoding="utf-8") as rf:
+   402→   402→                lines = rf.readlines()
+   403→   403→                out_string += "".join(lines[1:] if out_string else lines)
+   404→   404→
+   405→   405→        except Exception as ex:
+   406→   406→            print(f"Error: Cannot combine results from {rfile}.\n", flush=True)
+   407→   407→            utils.write_error_log(ex)
+   408→   408→
+   409→   409→    with open(os.path.join(cfg.OUTPUT_PATH, cfg.OUTPUT_CSV_FILENAME), "w", encoding="utf-8") as f:
+   410→   410→        f.write(out_string)
+   411→   411→
+   412→   412→
+   413→   413→def combine_results(saved_results: Sequence[dict[str, str] | str]):
+   414→   414→    """
+   415→   415→    Combines various types of result files based on the configuration settings.
+   416→   416→    This function checks the types of results specified in the configuration
+   417→   417→    and combines the corresponding files from the saved results list.
+   418→   418→
+   419→   419→    Args:
+   420→   420→        saved_results (list[dict[str, str]]): A list of dictionaries containing
+   421→   421→            file paths for different result types. Each dictionary represents
+   422→   422→            a set of result files for a particular analysis.
+   423→   423→
+   424→   424→    Returns:
+   425→   425→        None
+   426→   426→    """
+   427→   427→    if "table" in cfg.RESULT_TYPES:
+   428→   428→        combine_raven_tables([f["table"] for f in saved_results if isinstance(f, dict)])
+   429→   429→
+   430→   430→    if "kaleidoscope" in cfg.RESULT_TYPES:
+   431→   431→        combine_kaleidoscope_files([f["kaleidoscope"] for f in saved_results if isinstance(f, dict)])
+   432→   432→
+   433→   433→    if "csv" in cfg.RESULT_TYPES:
+   434→   434→        combine_csv_files([f["csv"] for f in saved_results if isinstance(f, dict)])
+   435→   435→
+   436→   436→
+   437→   437→def merge_consecutive_detections(results: dict[str, list], max_consecutive: int | None = None):
+   438→   438→    """Merges consecutive detections of the same species.
+   439→   439→    Uses the mean of the top-3 highest scoring predictions as
+   440→   440→    confidence score for the merged detection.
+   441→   441→
+   442→   442→    Args:
+   443→   443→        results: The dictionary with {segment: scores}.
+   444→   444→        max_consecutive: The maximum number of consecutive detections to merge.
+   445→   445→                          If None, merge all consecutive detections.
+   446→   446→
+   447→   447→    Returns:
+   448→   448→        The dictionary with merged detections.
+   449→   449→    """
+   450→   450→
+   451→   451→    # If max_consecutive is 0 or 1, return original results
+   452→   452→    if max_consecutive is not None and max_consecutive <= 1:
+   453→   453→        return results
+   454→   454→
+   455→   455→    # For each species, make list of timestamps and scores
+   456→   456→    species = {}
+   457→   457→    for timestamp, scores in results.items():
+   458→   458→        for label, score in scores:
+   459→   459→            if label not in species:
+   460→   460→                species[label] = []
+   461→   461→            species[label].append((timestamp, score))
+   462→   462→
+   463→   463→    # Sort timestamps by start time for each species
+   464→   464→    for label, timestamps in species.items():
+   465→   465→        species[label] = sorted(timestamps, key=lambda t: float(t[0].split("-", 1)[0]))
+   466→   466→
+   467→   467→    # Merge consecutive detections
+   468→   468→    merged_results = {}
+   469→   469→    for label in species:
+   470→   470→        timestamps = species[label]
+   471→   471→
+   472→   472→        # Check if end time of current detection is within the start time of the next detection
+   473→   473→        i = 0
+   474→   474→        while i < len(timestamps) - 1:
+   475→   475→            start, end = timestamps[i][0].split("-", 1)
+   476→   476→            next_start, next_end = timestamps[i + 1][0].split("-", 1)
+   477→   477→
+   478→   478→            if float(end) >= float(next_start):
+   479→   479→                # Merge detections
+   480→   480→                merged_scores = [timestamps[i][1], timestamps[i + 1][1]]
+   481→   481→                timestamps.pop(i)
+   482→   482→
+   483→   483→                while i < len(timestamps) - 1 and float(next_end) >= float(timestamps[i + 1][0].split("-", 1)[0]):
+   484→   484→                    if max_consecutive and len(merged_scores) >= max_consecutive:
+   485→   485→                        break
+   486→   486→                    merged_scores.append(timestamps[i + 1][1])
+   487→   487→                    next_end = timestamps[i + 1][0].split("-", 1)[1]
+   488→   488→                    timestamps.pop(i + 1)
+   489→   489→
+   490→   490→                # Calculate mean of top 3 scores
+   491→   491→                top_3_scores = sorted(merged_scores, reverse=True)[:3]
+   492→   492→                merged_score = sum(top_3_scores) / len(top_3_scores)
+   493→   493→
+   494→   494→                timestamps[i] = (f"{start}-{next_end}", merged_score)
+   495→   495→
+   496→   496→            i += 1
+   497→   497→
+   498→   498→        merged_results[label] = timestamps
+   499→   499→
+   500→   500→    # Restore original format
+   501→   501→    results = {}
+   502→   502→    for label, timestamps in merged_results.items():
+   503→   503→        for timestamp, score in timestamps:
+   504→   504→            if timestamp not in results:
+   505→   505→                results[timestamp] = []
+   506→   506→            results[timestamp].append((label, score))
+   507→   507→
+   508→   508→    return results
+   509→   509→
+   510→   510→
+   511→   511→def get_sorted_timestamps(results: dict[str, list]):
+   512→   512→    """Sorts the results based on the segments.
+   513→   513→
+   514→   514→    Args:
+   515→   515→        results: The dictionary with {segment: scores}.
+   516→   516→
+   517→   517→    Returns:
+   518→   518→        Returns the sorted list of segments and their scores.
+   519→   519→    """
+   520→   520→    return sorted(results, key=lambda t: float(t.split("-", 1)[0]))
+   521→   521→
+   522→   522→
+   523→   523→def get_raw_audio_from_file(fpath: str, offset, duration):
+   524→   524→    """Reads an audio file and splits the signal into chunks.
+   525→   525→
+   526→   526→    Args:
+   527→   527→        fpath: Path to the audio file.
+   528→   528→
+   529→   529→    Returns:
+   530→   530→        The signal split into a list of chunks.
+   531→   531→    """
+   532→   532→    # Open file
+   533→   533→    sig, rate = audio.open_audio_file(
+   534→   534→        fpath,
+   535→   535→        cfg.SAMPLE_RATE,
+   536→   536→        offset,
+   537→   537→        duration,
+   538→   538→        cfg.BANDPASS_FMIN,
+   539→   539→        cfg.BANDPASS_FMAX,
+   540→   540→        cfg.AUDIO_SPEED,
+   541→   541→    )
+   542→   542→
+   543→   543→    # Split into raw audio chunks
+   544→   544→    return audio.split_signal(sig, rate, cfg.SIG_LENGTH, cfg.SIG_OVERLAP, cfg.SIG_MINLEN)
+   545→   545→
+   546→   546→
+   547→   547→def iterate_audio_chunks(fpath: str, embeddings: bool = False):
+   548→   548→    """Iterates over audio chunks from a file.
+   549→   549→
+   550→   550→    Args:
+   551→   551→        fpath: Path to the audio file.
+   552→   552→        offset: Offset in seconds to start reading the file.
+   553→   553→
+   554→   554→    Yields:
+   555→   555→        Chunks of audio data.
+   556→   556→    """
+   557→   557→    fileLengthSeconds = audio.get_audio_file_length(fpath)
+   558→   558→    start, end = 0, cfg.SIG_LENGTH * cfg.AUDIO_SPEED
+   559→   559→    duration = int(cfg.FILE_SPLITTING_DURATION / cfg.AUDIO_SPEED)
+   560→   560→
+   561→   561→    while start < fileLengthSeconds and not np.isclose(start, fileLengthSeconds):
+   562→   562→        chunks = get_raw_audio_from_file(fpath, start, duration)
+   563→   563→        samples = []
+   564→   564→        timestamps = []
+   565→   565→
+   566→   566→        if not chunks:
+   567→   567→            break
+   568→   568→
+   569→   569→        for chunk_index, chunk in enumerate(chunks):
+   570→   570→            t_start = start + (chunk_index * (cfg.SIG_LENGTH - cfg.SIG_OVERLAP) * cfg.AUDIO_SPEED)
+   571→   571→            end = min(t_start + cfg.SIG_LENGTH * cfg.AUDIO_SPEED, fileLengthSeconds)
+   572→   572→
+   573→   573→            # Add to batch
+   574→   574→            samples.append(chunk)
+   575→   575→            timestamps.append([round(t_start, 2), round(end, 2)])
+   576→   576→
+   577→   577→            # Check if batch is full or last chunk
+   578→   578→            if len(samples) < cfg.BATCH_SIZE and chunk_index < len(chunks) - 1:
+   579→   579→                continue
+   580→   580→
+   581→   581→            # Predict
+   582→   582→            p = model.embeddings(samples) if embeddings else predict(samples)
+   583→   583→
+   584→   584→            # Add to results
+   585→   585→            for i in range(len(samples)):
+   586→   586→                # Get timestamp
+   587→   587→                s_start, s_end = timestamps[i]
+   588→   588→
+   589→   589→                yield s_start, s_end, p[i]
+   590→   590→
+   591→   591→            # Clear batch
+   592→   592→            samples = []
+   593→   593→            timestamps = []
+   594→   594→
+   595→   595→        start += len(chunks) * (cfg.SIG_LENGTH - cfg.SIG_OVERLAP) * cfg.AUDIO_SPEED
+   596→   596→
+   597→   597→
+   598→   598→def predict(samples):
+   599→   599→    """Predicts the classes for the given samples.
+   600→   600→
+   601→   601→    Args:
+   602→   602→        samples: Samples to be predicted.
+   603→   603→
+   604→   604→    Returns:
+   605→   605→        The prediction scores.
+   606→   606→    """
+   607→   607→    # Prepare sample and pass through model
+   608→   608→    data = np.array(samples, dtype="float32")
+   609→   609→    prediction = model.predict(data)
+   610→   610→
+   611→   611→    # Logits or sigmoid activations?
+   612→   612→    if cfg.APPLY_SIGMOID and not cfg.USE_PERCH:
+   613→   613→        prediction = model.flat_sigmoid(np.array(prediction), sensitivity=-1, bias=cfg.SIGMOID_SENSITIVITY)
+   614→   614→
+   615→   615→    return prediction
+   616→   616→
+   617→   617→
+   618→   618→def get_result_file_names(fpath: str):
+   619→   619→    """
+   620→   620→    Generates a dictionary of result file names based on the input file path and configured result types.
+   621→   621→
+   622→   622→    Args:
+   623→   623→        fpath (str): The file path of the input file.
+   624→   624→
+   625→   625→    Returns:
+   626→   626→        dict: A dictionary where the keys are result types (e.g., "table", "audacity", "r", "kaleidoscope", "csv")
+   627→   627→              and the values are the corresponding output file paths.
+   628→   628→    """
+   629→   629→    result_names = {}
+   630→   630→
+   631→   631→    rpath = fpath.replace(cfg.INPUT_PATH, "")
+   632→   632→
+   633→   633→    rpath = (rpath[1:] if rpath[0] in ["/", "\\"] else rpath) if rpath else os.path.basename(fpath)
+   634→   634→
+   635→   635→    file_shorthand = rpath.rsplit(".", 1)[0]
+   636→   636→
+   637→   637→    if "table" in cfg.RESULT_TYPES:
+   638→   638→        result_names["table"] = os.path.join(cfg.OUTPUT_PATH, file_shorthand + ".BirdNET.selection.table.txt")
+   639→   639→    if "audacity" in cfg.RESULT_TYPES:
+   640→   640→        result_names["audacity"] = os.path.join(cfg.OUTPUT_PATH, file_shorthand + ".BirdNET.results.txt")
+   641→   641→    # if "r" in cfg.RESULT_TYPES:
+   642→   642→    #     result_names["r"] = os.path.join(cfg.OUTPUT_PATH, file_shorthand + ".BirdNET.results.r.csv")
+   643→   643→    if "kaleidoscope" in cfg.RESULT_TYPES:
+   644→   644→        result_names["kaleidoscope"] = os.path.join(cfg.OUTPUT_PATH, file_shorthand + ".BirdNET.results.kaleidoscope.csv")
+   645→   645→    if "csv" in cfg.RESULT_TYPES:
+   646→   646→        result_names["csv"] = os.path.join(cfg.OUTPUT_PATH, file_shorthand + ".BirdNET.results.csv")
+   647→   647→
+   648→   648→    return result_names
+   649→   649→
+   650→   650→
+   651→   651→def analyze_file(item) -> dict[str, str] | None:
+   652→   652→    """
+   653→   653→    Analyzes an audio file and generates prediction results.
+   654→   654→
+   655→   655→    Args:
+   656→   656→        item (tuple): A tuple containing the file path (str) and configuration settings.
+   657→   657→
+   658→   658→    Returns:
+   659→   659→        dict or None: A dictionary of result file names if analysis is successful,
+   660→   660→                      None if the file is skipped or an error occurs.
+   661→   661→    Raises:
+   662→   662→        Exception: If there is an error in reading the audio file or saving the results.
+   663→   663→    """
+   664→   664→    # Get file path and restore cfg
+   665→   665→    fpath: str = item[0]
+   666→   666→    cfg.set_config(item[1])
+   667→   667→
+   668→   668→    result_file_names = get_result_file_names(fpath)
+   669→   669→
+   670→   670→    if cfg.SKIP_EXISTING_RESULTS and all(os.path.exists(f) for f in result_file_names.values()):
+   671→   671→        print(f"Skipping {fpath} as it has already been analyzed", flush=True)
+   672→   672→        return None  # or return path to combine later? TODO
+   673→   673→
+   674→   674→    # Start time
+   675→   675→    start_time = datetime.datetime.now()
+   676→   676→    results = {}
+   677→   677→
+   678→   678→    # Status
+   679→   679→    print(f"Analyzing {fpath}", flush=True)
+   680→   680→
+   681→   681→    # Process each chunk
+   682→   682→    try:
+   683→   683→        for s_start, s_end, pred in iterate_audio_chunks(fpath):
+   684→   684→            if not cfg.LABELS:
+   685→   685→                cfg.LABELS = [f"Species-{i}_Species-{i}" for i in range(len(pred))]
+   686→   686→
+   687→   687→            # Assign scores to labels
+   688→   688→            p_labels = [
+   689→   689→                p for p in zip(cfg.LABELS, pred, strict=True) if (cfg.TOP_N or p[1] >= cfg.MIN_CONFIDENCE) and (not cfg.SPECIES_LIST or p[0] in cfg.SPECIES_LIST)
+   690→   690→            ]
+   691→   691→
+   692→   692→            # Sort by score
+   693→   693→            p_sorted = sorted(p_labels, key=operator.itemgetter(1), reverse=True)
+   694→   694→
+   695→   695→            if cfg.TOP_N:
+   696→   696→                p_sorted = p_sorted[: cfg.TOP_N]
+   697→   697→
+   698→   698→            # TODO: hier schon top n oder min conf raussortieren
+   699→   699→            # Store top 5 results and advance indices
+   700→   700→            results[str(s_start) + "-" + str(s_end)] = p_sorted
+   701→   701→
+   702→   702→    except Exception as ex:
+   703→   703→        # Write error log
+   704→   704→        print(f"Error: Cannot analyze audio file {fpath}.\n", flush=True)
+   705→   705→        utils.write_error_log(ex)
+   706→   706→        msg = str(ex)
+   707→   707→
+   708→   708→        return msg or repr(ex).strip("()")
+   709→   709→
+   710→   710→    # Save as selection table
+   711→   711→    try:
+   712→   712→        save_result_files(results, result_file_names, fpath)
+   713→   713→
+   714→   714→    except Exception as ex:
+   715→   715→        # Write error log
+   716→   716→        print(f"Error: Cannot save result for {fpath}.\n", flush=True)
+   717→   717→        utils.write_error_log(ex)
+   718→   718→
+   719→   719→        return str(ex)
+   720→   720→
+   721→   721→    delta_time = (datetime.datetime.now() - start_time).total_seconds()
+   722→   722→    print(f"Finished {fpath} in {delta_time:.2f} seconds", flush=True)
+   723→   723→
+   724→   724→    return result_file_names
+   725→   725→
