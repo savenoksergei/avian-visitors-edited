@@ -245,3 +245,94 @@ cd /home/z/my-project/avian-visitors && python -m pytest test_audio_capture.py -
 | Интеграция с БД — записи попадают в detections | ✅ |
 
 ---
+
+## Часть 3 — FastAPI: JSON-эндпоинты
+
+**Статус:** ✅ готово (36/36 тестов)
+
+### Что сделано
+
+#### 3.1 api.py — FastAPI приложение
+
+Файл: `api.py` — FastAPI app с 8 эндпоинтами + lifespan.
+
+**Эндпоинты:**
+
+| Эндпоинт | Метод | Параметры | Описание |
+|----------|-------|-----------|----------|
+| `/api/health` | GET | — | Базовый health check |
+| `/api/listener/status` | GET | — | Диагностика AudioListener (сегменты, uptime) |
+| `/api/stats` | GET | — | Общая статистика |
+| `/api/recent` | GET | `hours` (1..1000000, default 24) | Виды за последние N часов |
+| `/api/lifelist` | GET | — | Все виды, когда-либо обнаруженные |
+| `/api/species` | GET | `sci` (required) | Детали по одному виду (404 если нет) |
+| `/api/timeseries` | GET | `days` (1..90, default 30) | Дневные + часовые агрегации |
+| `/api/firstseen` | GET | `limit` (1..50, default 10) | Новейшие добавления к lifelist |
+| `/api/upload` | POST | `file`, `confidence?`, `latitude?`, `longitude?` | Загрузка аудио → BirdNET анализ |
+
+**Архитектурные решения:**
+
+1. **Модульные синглтоны:** `db` (Database) и `listener` (AudioListener | None) создаются на уровне модуля. Все эндпоинты используют один и тот же объект Database.
+
+2. **Lifespan context manager:** При старте приложения lifespan инициализирует БД (`db.init()`) и стартует AudioListener. При остановке — останавливает listener и закрывает БД. Это гарантирует корректную инициализацию при использовании uvicorn.
+
+3. **ENV-переменные для настройки:**
+   - `AVIAN_NO_AUDIO=1` — отключает AudioListener (для тестов и CI)
+   - `AVIAN_LAT`, `AVIAN_LON` — координаты (default: Москва 55.75, 37.62)
+   - `AVIAN_CONFIDENCE` — порог уверенности (default: 0.25)
+
+4. **Upload endpoint:**
+   - Валидация расширения файла (wav, mp3, ogg, m4a, flac)
+   - Параметры через Form fields (confidence, latitude, longitude) с fallback на env vars
+   - Файл сохраняется во временный файл, анализируется через `analyze_file()`, затем удаляется
+   - Стриминг загрузки чанками по 1 МБ (не загружает весь файл в память)
+   - При ошибке анализа — 500 с деталями
+
+5. **Валидация параметров:** FastAPI Query с `ge`/`le` для числовых параметров (hours, days, limit, confidence). Неправильные значения → 422 Unprocessable Entity.
+
+#### 3.2 Исправление бага в database.py
+
+Обнаружен баг: `species_detail()` для несуществующего вида возвращал `summary` не как None, а как `{'com': None, 'total': 0, ...}`. Причина: SQL `SELECT ... COUNT(*) ... WHERE Sci_Name = ?` без GROUP BY возвращает одну строку с `total=0` даже при пустой таблице.
+
+**Фикс:** Добавлены `GROUP BY Sci_Name HAVING COUNT(*) > 0` — теперь при отсутствии записей `fetchone()` возвращает `None`, и эндпоинт корректно отвечает 404.
+
+#### 3.3 Исправление thread-safety в database.py
+
+Добавлен `check_same_thread=False` в `sqlite3.connect()`. Это необходимо потому что:
+- FastAPI (uvicorn) обрабатывает запросы в пуле потоков
+- AudioListener пишет в БД из отдельного потока
+- Без этого флага SQLite выбрасывает `ProgrammingError` при доступе из другого потока
+
+Безопасность обеспечивается WAL-режимом + `busy_timeout=2000` (из Части 1).
+
+#### 3.4 test_api.py — 36 тестов
+
+| Категория | Тесты | Что проверяют |
+|-----------|-------|---------------|
+| TestHealth (3) | health_ok, listener_disabled, listener_running | Health check + статус слушателя |
+| TestStats (2) | empty_db, populated_db | Пустая и заполненная статистика |
+| TestRecent (5) | empty, default_hours, custom, fields, clamping | Параметры + структура ответа |
+| TestLifelist (3) | empty, populated, fields | Lifelist + сортировка |
+| TestSpecies (4) | missing_param, not_found, found, order | 422/404/200 + порядок детекций |
+| TestTimeseries (3) | empty, populated, clamping | days validation + структура |
+| TestFirstseen (4) | empty, populated, limit, fields | DESC сортировка + limit |
+| TestUpload (6) | no_file, bad_ext, success, params, error, cleanup | Валидация + мок-анализ + cleanup |
+| TestResponseFormat (6) | stats, recent, lifelist, species, timeseries, firstseen | Полная совместимость с PHP API форматом |
+
+**Особенности тестов:**
+- `os.environ["AVIAN_NO_AUDIO"] = "1"` — отключает AudioListener в lifespan
+- `sys.modules["sounddevice"] = MagicMock()` — мокает sounddevice (нет реального микрофона)
+- `analyze_file` мокируется через `patch("api.analyze_file")` — не загружает TFLite модель
+- Реальная in-memory SQLite для каждого теста — полная изоляция
+- populated_client fixture вставляет 4 детекции 3 видов за 2 дня
+
+### Результат тестирования
+
+```
+cd /home/z/my-project/avian-visitors/avian-visitors && python -m pytest test_api.py -v
+======================== 36 passed in 1.53s =========================
+```
+
+Все 36 тестов проходят. Время выполнения — 1.53 секунды.
+
+---

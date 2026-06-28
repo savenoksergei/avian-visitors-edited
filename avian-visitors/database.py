@@ -45,7 +45,7 @@ class Database:
     def _get_conn(self) -> sqlite3.Connection:
         """Возвращает соединение (создаёт при первом вызове)."""
         if self._conn is None:
-            self._conn = sqlite3.connect(self.db_path)
+            self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=2000")
@@ -255,7 +255,9 @@ class Database:
             "  MAX(Date || ' ' || Time) AS last_seen, "
             "  MAX(Confidence) AS best_conf "
             "FROM detections "
-            "WHERE Sci_Name = ?",
+            "WHERE Sci_Name = ? "
+            "GROUP BY Sci_Name "
+            "HAVING COUNT(*) > 0",
             (sci_name,),
         ).fetchone()
         return {
