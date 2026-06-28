@@ -256,17 +256,21 @@ class AudioListener:
         """
         Main capture loop.
 
-        sounddevice.InputStream with blocksize = 3 sec — each read()
-        returns exactly one segment for BirdNET.
+        Uses a small blocksize (configurable, default 4096) for portability
+        across OS (macOS PortAudio cannot handle 144000-sample blocks).
+        Audio is accumulated into a numpy ring buffer; once 3 seconds are
+        collected, the segment is sent to BirdNET.
         """
         stream = None
         try:
+            # Use a small blocksize that works on all platforms
+            blocksize = 4096
             stream = sounddevice.InputStream(
                 samplerate=self.sample_rate,
                 channels=CHANNELS,
                 dtype="float32",
                 device=self.device,
-                blocksize=self.segment_samples,
+                blocksize=blocksize,
             )
             dev = stream.device
             if isinstance(dev, (tuple, list)) and len(dev) > 0:
@@ -281,24 +285,42 @@ class AudioListener:
                 "Audio device opened: %s @ %d Hz, blocksize=%d",
                 dev_name,
                 stream.samplerate,
-                self.segment_samples,
+                blocksize,
             )
+
+            # Ring buffer: accumulate small chunks until we have a full segment
+            buf = np.zeros(self.segment_samples, dtype="float32")
+            buf_pos = 0
 
             while self._running:
                 try:
-                    data, overflow = stream.read(self.segment_samples)
-                except sounddevice.InputOverflowError:
-                    logger.warning("Audio input overflow, skipping segment")
+                    data, overflow = stream.read(blocksize)
+                except sounddevice.PortAudioError as e:
+                    # Log but continue — transient errors (overflow, etc.)
+                    logger.warning("Audio read error (continuing): %s", e)
                     continue
                 except OSError as e:
                     if self._running:
                         logger.error("Audio read error: %s", e)
                     break
 
-                # data shape: (segment_samples, 1) → take mono channel
-                segment = data[:, 0] if data.ndim > 1 else data
+                # data shape: (blocksize, 1) → take mono channel
+                chunk = data[:, 0] if data.ndim > 1 else data
+                chunk_len = len(chunk)
 
-                self._process_segment(segment)
+                # Fill the buffer
+                remaining = self.segment_samples - buf_pos
+                if chunk_len >= remaining:
+                    # Fill rest of buffer and process
+                    buf[buf_pos:] = chunk[:remaining]
+                    self._process_segment(buf.copy())
+                    # Put leftover at the start of next buffer
+                    leftover = chunk[remaining:]
+                    buf[:len(leftover)] = leftover
+                    buf_pos = len(leftover)
+                else:
+                    buf[buf_pos:buf_pos + chunk_len] = chunk
+                    buf_pos += chunk_len
 
                 if self._stop_event.is_set():
                     break
