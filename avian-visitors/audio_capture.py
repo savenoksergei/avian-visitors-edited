@@ -7,7 +7,7 @@ BirdNET v2.4 анализ → SQLite через database.py.
 Использует:
   - sounddevice — захват аудио с микрофона
   - numpy — буферизация
-  - birdnet (pip-пакет v0.2.16) — акустическая модель + опционально geo-фильтрация
+  - birdnet (pip-пакет v0.2.16) — акустическая модель
   - database.Database — запись результатов
 
 Координаты по умолчанию: Москва 55.75°N, 37.62°E.
@@ -15,12 +15,9 @@ BirdNET v2.4 анализ → SQLite через database.py.
 """
 
 import logging
-import queue
-import signal
-import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -46,16 +43,22 @@ CONFIDENCE_THRESHOLD = 0.25
 LATITUDE = 55.75
 LONGITUDE = 37.62
 
-# Device selection ("" = default, "cpu" = CPU only, "gpu" = GPU)
-DEVICE = ""
-
 
 class AudioListener:
     """
     Захват звука с микрофона и анализ через BirdNET.
 
-    Работает в фоновом потоке. Запуск через start(), остановка через stop()
-    или контекст-менеджер (with-блок).
+    Работает в фоновом потоке. Запуск через start(), остановка через stop().
+
+    Usage::
+
+        db = Database()
+        db.init()
+        listener = AudioListener(db)
+        listener.start()
+        # ... работает в фоне ...
+        listener.stop()
+        db.close()
     """
 
     def __init__(
@@ -66,7 +69,7 @@ class AudioListener:
         confidence_threshold: float = CONFIDENCE_THRESHOLD,
         latitude: float = LATITUDE,
         longitude: float = LONGITUDE,
-        device: str = DEVICE,
+        device=None,
     ):
         self.db = db
         self.sample_rate = sample_rate
@@ -75,13 +78,17 @@ class AudioListener:
         self.confidence_threshold = confidence_threshold
         self.latitude = latitude
         self.longitude = longitude
-        self.device = device
+        self.device = device  # None = default mic
 
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-        # Счётчики для логирования
+        # Ленивая загрузка модели (загружается один раз)
+        self._model = None
+        self._model_lock = threading.Lock()
+
+        # Счётчики для диагностики
         self._segments_processed = 0
         self._detections_written = 0
         self._start_time: Optional[float] = None
@@ -93,7 +100,7 @@ class AudioListener:
     def start(self):
         """Запускает захват и анализ в фоновом потоке."""
         if self._running:
-            logger.warning("AudioListener уже запущен")
+            logger.warning("AudioListener already running")
             return
 
         self._running = True
@@ -109,7 +116,7 @@ class AudioListener:
         )
         self._thread.start()
         logger.info(
-            "Audio capture started: %d Hz, %d-ch segments, "
+            "Audio capture started: %d Hz, %.1fs segments, "
             "confidence > %.2f, lat=%.2f lon=%.2f",
             self.sample_rate,
             self.segment_duration,
@@ -152,6 +159,33 @@ class AudioListener:
         }
 
     # ------------------------------------------------------------------
+    # Internal: lazy model loading (thread-safe, once)
+    # ------------------------------------------------------------------
+
+    def _ensure_model(self):
+        """
+        Загружает BirdNET v2.4 акустическую модель один раз.
+        При первом запуске модель скачивается (~90 MB) и кэшируется.
+        """
+        if self._model is not None:
+            return
+
+        with self._model_lock:
+            if self._model is not None:
+                return
+
+            from birdnet import load as birdnet_load
+
+            logger.info("Loading BirdNET acoustic model (2.4, backend=tf)...")
+            self._model = birdnet_load("acoustic", "2.4", "tf")
+            logger.info(
+                "Model loaded. SR=%d Hz, segment=%.1fs, %d species",
+                self._model.get_sample_rate(),
+                self._model.get_segment_size_s(),
+                self._model.n_species,
+            )
+
+    # ------------------------------------------------------------------
     # Internal: capture loop
     # ------------------------------------------------------------------
 
@@ -159,76 +193,56 @@ class AudioListener:
         """
         Основной цикл захвата.
 
-        Использует кольцевой буфер для непрерывного аудиопотока.
-        Каждые 3 секунды буфер отправляется в BirdNET.
+        sounddevice.InputStream с blocksize = 3 сек — каждый read()
+        возвращает ровно один сегмент для BirdNET.
         """
-        logger.info("Audio capture loop started (device: %s)", self.device)
-
+        stream = None
         try:
-            # Создаём поток audio для ввода
             stream = sounddevice.InputStream(
                 samplerate=self.sample_rate,
                 channels=CHANNELS,
                 dtype="float32",
                 device=self.device,
-                blocksize=int(self.sample_rate * self.segment_duration),
+                blocksize=self.segment_samples,
             )
+            dev_info = stream.device[0] if stream.device else None
+            dev_name = dev_info["name"] if dev_info else "default"
             logger.info(
-                "Audio device opened: %s @ %d Hz",
-                stream.device.name,
+                "Audio device opened: %s @ %d Hz, blocksize=%d",
+                dev_name,
                 stream.samplerate,
+                self.segment_samples,
             )
 
-            # Кольцевой буфер: 3 секунды * sample_rate
-            buffer = np.zeros(self.segment_samples, dtype=np.float32)
-
-            # Читаем аудио в буфер
             while self._running:
                 try:
-                    chunk, overflow = stream.read(self.segment_samples)
+                    data, overflow = stream.read(self.segment_samples)
                 except sounddevice.InputOverflowError:
-                    # Переполнение — записываем только новую часть
-                    pass
+                    logger.warning("Audio input overflow, skipping segment")
+                    continue
                 except OSError as e:
                     if self._running:
                         logger.error("Audio read error: %s", e)
                     break
-                else:
-                    if chunk is None:
-                        logger.debug("No audio data (stream ended)")
-                        time.sleep(0.1)
-                        continue
 
-                    # Добавляем новые сэмплы в буфер
-                    n_new = len(chunk)
-                    if n_new > 0:
-                        # Сдвигаем старые данные
-                        buffer = np.roll(buffer, -n_new)
-                        buffer[-n_new:] = chunk
+                # data shape: (segment_samples, 1) → берём моно-канал
+                segment = data[:, 0] if data.ndim > 1 else data
 
-                    # Когда набрали достаточно данных для сегмента
-                    if len(chunk) == 0:
-                        time.sleep(0.01)
-                        continue
+                self._process_segment(segment)
 
-                    # Проверяем, есть ли полный сегмент
-                    if np.abs(np.sin(2 * np.pi * np.arange(len(buffer)) / self.segment_samples))[-1] > 0:
-                        self._process_segment(buffer.copy())
-                        # Обнуляем буфер (данные уже обработаны)
-                        buffer[:] = 0.0
-
-                except Exception as e:
-                    logger.error("Error in capture loop: %s", e)
-                    time.sleep(1)
+                if self._stop_event.is_set():
+                    break
 
         except Exception as e:
-            logger.error("Fatal error in audio capture: %s", e)
+            logger.error("Fatal error in audio capture: %s", e, exc_info=True)
         finally:
-            try:
-                stream.stop()
-                logger.info("Audio stream closed")
-            except Exception:
-                pass
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                    logger.info("Audio stream closed")
+                except Exception:
+                    pass
             self._running = False
             logger.info("Audio capture loop ended")
 
@@ -236,90 +250,90 @@ class AudioListener:
     # Internal: BirdNET inference
     # ------------------------------------------------------------------
 
-    def _load_model(self):
-        """
-        Загружает акустическую модель BirdNET v2.4.
-        При первом запуске модель скачивается автоматически (~90 MB).
-        """
-        from birdnet import load as birdnet_load, AcousticPredictionSession
-
-        logger.info("Loading BirdNET acoustic model (v2.4, backend=tf)...")
-        model = birdnet_load("acoustic", "v2.4", "tf")
-        logger.info(
-            "Model loaded. SR=%d Hz, segment=%.1fs, %d species",
-            model.model_sr,
-            model.segment_duration_s,
-            model.n_species,
-        )
-
-        # Создаём сессию для предсказаний
-        session = AcousticPredictionSession(model)
-        logger.info("AcousticPredictionSession ready")
-        return model, session
-
     def _process_segment(self, audio: np.ndarray):
         """
         Прогоняет один 3-секундный аудиосегмент через BirdNET
         и записывает детекции в БД.
 
         Args:
-            audio: numpy массив shape (segment_samples,) с аудио.
+            audio: numpy массив shape (segment_samples,) float32.
         """
         try:
-            model, session = self._load_model()
+            self._ensure_model()
         except Exception as e:
             logger.error("Failed to load BirdNET model: %s", e)
             return
 
         self._segments_processed += 1
 
-        # Предсказание
+        # Предсказание через BirdNET
+        # top_k=None → все 6522 вида; threshold=0.0 → без отсечения на уровне модели
         try:
-            # run_arrays принимает список кортежей (audio_array, sample_rate)
-            result = session.run_arrays((audio, self.sample_rate))
+            result = self._model.predict_arrays(
+                (audio, self.sample_rate),
+                top_k=None,
+                default_confidence_threshold=0.0,
+            )
         except Exception as e:
             logger.error("BirdNET prediction failed: %s", e)
             return
 
-        # Разбираем результаты
+        # Результат: species_probs shape (n_inputs, n_segments, n_species)
+        # Для одного сегмента: probs = result.species_probs[0, 0]
         try:
-            probs = result.species_probs  # shape: (n_species,)
-            species_list = result.species_list  # OrderedSet[str]
+            probs = result.species_probs[0, 0]  # shape (6522,)
+            species_list = result.species_list    # OrderedSet[str], len=6522
 
-            # Для каждого вида с confidence > threshold — записываем
+            now = datetime.now()
+            detections_this_segment = 0
+
             for i, conf in enumerate(probs):
                 if conf > self.confidence_threshold:
-                    sci_name = species_list[i]
-                    com_name = sci_name  # birdnet даёт латинские имена
-
-                    # Пропускаем "Latin Name" в "Common Name" для записи в БД.
-                    # birdnet v2.4 species_list содержит "Latin Name" (binomial).
-                    # Для совместимости с фронтендом (он ждёт Com_Name)
-                    # форматируем как "Genus species".
-                    parts = sci_name.split(" ", 1)
-                    com_name = sci_name if len(parts) < 2 else f"{parts[0]} {parts[1]}"
+                    raw = str(species_list[i])
+                    # species_list формат: "Genus species_Common Name"
+                    # Разделяем на sci_name и com_name
+                    if "_" in raw:
+                        # Берём первую часть до первого подчёркивания,
+                        # но binomial имеет пробел, а не подчёркивание:
+                        # "Psittacara strenuus_Pacific Parakeet"
+                        underscore_idx = raw.index("_")
+                        sci_name = raw[:underscore_idx]
+                        com_name = raw[underscore_idx + 1:]
+                    else:
+                        sci_name = raw
+                        com_name = raw
 
                     self.db.insert_detection(
                         sci_name=sci_name,
                         com_name=com_name,
                         confidence=float(conf),
+                        dt=now,
                     )
                     self._detections_written += 1
+                    detections_this_segment += 1
                     logger.info(
-                        "%.2f  %s",
+                        "  [%.3f] %s",
                         float(conf),
-                        com_name,
+                        sci_name,
                     )
+
+            if detections_this_segment == 0:
+                logger.debug(
+                    "Segment #%d: no detections above %.2f",
+                    self._segments_processed,
+                    self.confidence_threshold,
+                )
+            else:
+                logger.info(
+                    "Segment #%d: %d detection(s)",
+                    self._segments_processed,
+                    detections_this_segment,
+                )
         except Exception as e:
-            logger.error("Error processing results: %s", e)
+            logger.error("Error processing BirdNET results: %s", e)
 
 
-def _slugify(sci_name: str) -> str:
-    """Переводит научное имя в slug для файла: 'Columba livia' → 'columba-livia'."""
-    return sci_name.lower().replace(" ", "-")
-
-
-# ── Тестирование ─────────────────────────────────────────────────────── #
+# ── Standalone test ────────────────────────────────────────────────── #
 
 if __name__ == "__main__":
     logging.basicConfig(
@@ -328,18 +342,23 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
     )
 
-    print("=== AudioListener quick test ===")
-    print("Creating database...")
+    print("=== AudioListener standalone test ===")
+    print("Will capture from default microphone for 10 seconds.")
+    print("Threshold lowered to 0.01 to see any output.\n")
+
     db = Database()
     db.init()
-    print("Starting audio capture for 5 seconds...")
 
-    listener = AudioListener(db, confidence_threshold=0.01)  # низкий порог для теста
+    listener = AudioListener(db, confidence_threshold=0.01)
     listener.start()
-    time.sleep(5)
-    listener.stop()
 
-    print(f"\nStats: {listener.stats}")
+    print("Listening... (10 seconds)")
+    for i in range(10):
+        time.sleep(1)
+        print(f"  {i+1}s  stats: {listener.stats}")
+
+    listener.stop()
+    print(f"\nFinal stats: {listener.stats}")
     print(f"Database stats: {db.stats()}")
     db.close()
     print("Done.")
