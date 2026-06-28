@@ -20,7 +20,7 @@ main.py — единая точка входа для AvianVisitors Desktop.
     AVIAN_NO_AUDIO      — "1" отключает микрофон
     AVIAN_LAT           — широта (по умолчанию 55.75, Москва)
     AVIAN_LON           — долгота (по умолчанию 37.62, Москва)
-    AVIAN_CONFIDENCE    — порог уверенности (по умолчанию 0.25)
+    AVIAN_CONFIDENCE    — порог уверенности (по умолчанию 0.7)
     AVIAN_SENSITIVITY   — чувствительность BirdNET (по умолчанию 1.0)
     AVIAN_LOG_LEVEL     — уровень логов (DEBUG/INFO/WARNING, по умолчанию INFO)
     AVIAN_NO_BROWSER    — "1" не открывать браузер автоматически
@@ -52,7 +52,7 @@ DEFAULTS = {
     "port": 8080,
     "lat": 55.75,
     "lon": 37.62,
-    "confidence": 0.25,
+    "confidence": 0.7,
     "sensitivity": 1.0,
     "no_audio": False,
     "audio_device": None,
@@ -203,7 +203,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--port", type=int, default=None, help="HTTP port (default: 8080)")
     p.add_argument("--lat", type=float, default=None, help="Latitude (default: 55.75)")
     p.add_argument("--lon", type=float, default=None, help="Longitude (default: 37.62)")
-    p.add_argument("--confidence", type=float, default=None, help="Min confidence 0-1 (default: 0.25)")
+    p.add_argument("--confidence", type=float, default=None, help="Min confidence 0-1 (default: 0.7)")
     p.add_argument("--sensitivity", type=float, default=None, help="BirdNET sensitivity (default: 1.0)")
     p.add_argument("--device", type=int, default=None,
                     help="Audio device index (default: system default)")

@@ -16,7 +16,7 @@ SAMPLE_RATE = 48_000
 SEGMENT_DURATION = 3.0
 SEGMENT_SAMPLES = int(SAMPLE_RATE * SEGMENT_DURATION)
 CHANNELS = 1
-CONFIDENCE_THRESHOLD = 0.25
+CONFIDENCE_THRESHOLD = 0.7
 LATITUDE = 55.75
 LONGITUDE = 37.62
 
@@ -264,7 +264,7 @@ class AudioListener:
                                        sensitivity=-1,
                                        bias=cfg.SIGMOID_SENSITIVITY)[0]
         now = datetime.now()
-        det = 0
+        hits = []
         ss = set(self._species_list) if self._species_list else None
 
         for i, conf in enumerate(probs):
@@ -277,15 +277,17 @@ class AudioListener:
             self.db.insert_detection(sci_name=sci, com_name=com,
                                      confidence=float(conf), dt=now)
             self._detections_written += 1
-            det += 1
-            logger.debug("  [%.3f] %s (%s)", conf, sci, com)
+            hits.append((com, sci, float(conf)))
 
-        if det == 0:
+        if not hits:
             logger.debug("Seg #%d: no hits > %.2f",
                          self._segments_processed, self.confidence_threshold)
         else:
-            logger.info("Seg #%d: %d detection(s)",
-                        self._segments_processed, det)
+            # Highest confidence first; show common name, scientific name, percent.
+            hits.sort(key=lambda h: h[2], reverse=True)
+            birds = ", ".join(f"{com} ({sci}) {conf * 100:.0f}%"
+                              for com, sci, conf in hits)
+            logger.info("Seg #%d: %s", self._segments_processed, birds)
 
     @staticmethod
     def _parse_label(label):
