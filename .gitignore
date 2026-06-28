@@ -1,2 +1,29 @@
-skills/
+# Dependencies
 node_modules/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data
+avian-visitors/data/birds.db
+avian-visitors/data/*.db
+avian-visitors/.pytest_cache/
+
+# Tool output
+tool-results/
+
+# Uploaded audio
+upload/
+
+# Skills (internal)
+skills/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
