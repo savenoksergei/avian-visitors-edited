@@ -268,8 +268,15 @@ class AudioListener:
                 device=self.device,
                 blocksize=self.segment_samples,
             )
-            dev_info = stream.device[0] if stream.device else None
-            dev_name = dev_info["name"] if dev_info else "default"
+            dev = stream.device
+            if isinstance(dev, (tuple, list)) and len(dev) > 0:
+                dev_name = dev[0].get("name", "unknown") if isinstance(dev[0], dict) else str(dev[0])
+            elif isinstance(dev, dict):
+                dev_name = dev.get("name", "unknown")
+            elif isinstance(dev, int):
+                dev_name = f"device-{dev}"
+            else:
+                dev_name = "default"
             logger.info(
                 "Audio device opened: %s @ %d Hz, blocksize=%d",
                 dev_name,
