@@ -16,6 +16,7 @@ Default confidence threshold: 0.25.
 """
 
 import logging
+import queue
 import threading
 import time
 from datetime import datetime
@@ -256,14 +257,40 @@ class AudioListener:
         """
         Main capture loop.
 
-        Uses a small blocksize (configurable, default 4096) for portability
-        across OS (macOS PortAudio cannot handle 144000-sample blocks).
-        Audio is accumulated into a numpy ring buffer; once 3 seconds are
-        collected, the segment is sent to BirdNET.
+        Uses PortAudio callback mode for cross-platform reliability.
+        On macOS, blocking read() from a non-main thread causes
+        'Stream is stopped' errors. Callback mode lets PortAudio manage
+        its own internal thread.
+
+        Audio is accumulated into a numpy buffer; once 3 seconds are
+        collected, the segment is put on a queue for BirdNET processing.
         """
+        segment_queue = queue.Queue()
+        buf = np.zeros(self.segment_samples, dtype="float32")
+        buf_pos = [0]  # mutable container for closure
+
+        def _audio_callback(indata, frames, time_info, status):
+            """PortAudio callback — fills ring buffer, enqueues full segments."""
+            if status:
+                logger.debug("Audio status: %s", status)
+            chunk = indata[:, 0] if indata.ndim > 1 else indata
+            chunk_len = len(chunk)
+            remaining = self.segment_samples - buf_pos[0]
+            if chunk_len >= remaining:
+                buf[buf_pos[0]:] = chunk[:remaining]
+                try:
+                    segment_queue.put_nowait(buf.copy())
+                except queue.Full:
+                    pass  # drop if processing can't keep up
+                leftover = chunk[remaining:]
+                buf[:len(leftover)] = leftover
+                buf_pos[0] = len(leftover)
+            else:
+                buf[buf_pos[0]:buf_pos[0] + chunk_len] = chunk
+                buf_pos[0] += chunk_len
+
         stream = None
         try:
-            # Use a small blocksize that works on all platforms
             blocksize = 4096
             stream = sounddevice.InputStream(
                 samplerate=self.sample_rate,
@@ -271,6 +298,7 @@ class AudioListener:
                 dtype="float32",
                 device=self.device,
                 blocksize=blocksize,
+                callback=_audio_callback,
             )
             dev = stream.device
             if isinstance(dev, (tuple, list)) and len(dev) > 0:
@@ -282,46 +310,17 @@ class AudioListener:
             else:
                 dev_name = "default"
             logger.info(
-                "Audio device opened: %s @ %d Hz, blocksize=%d",
-                dev_name,
-                stream.samplerate,
-                blocksize,
+                "Audio device opened: %s @ %d Hz, blocksize=%d (callback mode)",
+                dev_name, stream.samplerate, blocksize,
             )
 
-            # Ring buffer: accumulate small chunks until we have a full segment
-            buf = np.zeros(self.segment_samples, dtype="float32")
-            buf_pos = 0
-
+            # Process segments from the queue
             while self._running:
                 try:
-                    data, overflow = stream.read(blocksize)
-                except sounddevice.PortAudioError as e:
-                    # Log but continue — transient errors (overflow, etc.)
-                    logger.warning("Audio read error (continuing): %s", e)
+                    segment = segment_queue.get(timeout=1.0)
+                    self._process_segment(segment)
+                except queue.Empty:
                     continue
-                except OSError as e:
-                    if self._running:
-                        logger.error("Audio read error: %s", e)
-                    break
-
-                # data shape: (blocksize, 1) → take mono channel
-                chunk = data[:, 0] if data.ndim > 1 else data
-                chunk_len = len(chunk)
-
-                # Fill the buffer
-                remaining = self.segment_samples - buf_pos
-                if chunk_len >= remaining:
-                    # Fill rest of buffer and process
-                    buf[buf_pos:] = chunk[:remaining]
-                    self._process_segment(buf.copy())
-                    # Put leftover at the start of next buffer
-                    leftover = chunk[remaining:]
-                    buf[:len(leftover)] = leftover
-                    buf_pos = len(leftover)
-                else:
-                    buf[buf_pos:buf_pos + chunk_len] = chunk
-                    buf_pos += chunk_len
-
                 if self._stop_event.is_set():
                     break
 
