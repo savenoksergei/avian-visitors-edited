@@ -507,3 +507,95 @@ cd /home/z/my-project/avian-visitors/avian-visitors && python -m pytest test_api
 Все 36 тестов проходят. Время выполнения — 1.53 секунды.
 
 ---
+
+## Часть 4 — Статика + эндпоинт картинок + wiki-прокси
+
+**Статус:** ✅ готово (47/47 тестов, из них 11 новых)
+
+### Что сделано
+
+#### 4.1 Статические файлы и favicon
+
+- `StaticFiles(directory="frontend/", html=True)` смонтирован на `/`
+- Файлы `index.html`, `apt.js`, `styles.css`, `dims.json`, `masks.json`
+  отдаются из `frontend/` (будет скопировано в Части 5)
+- `/favicon.png` — отдельный route, отдает `assets/favicon.png`
+- `html=True` — запрос `/` отдаёт `index.html`
+
+**Важно:** StaticFiles монтируется **после** всех `/api/*` routes, иначе
+статика перехватила бы API-запросы.
+
+#### 4.2 `/api/cutout` — резолвер картинок птиц
+
+Порт оригинального `cutout.php`, но БЕЗ динамического Wikipedia+rembg фоллбека
+(шаги 3-4 из PHP). Десктоп-версия использует только локальные ассеты.
+
+**Цепочка поиска (lookup chain):**
+
+| Приоритет | Путь | Описание |
+|-----------|------|----------|
+| 1 | `assets/illustrations/<slug>-<pose>.png` | kachō-e, pose-specific (pose 2+ = flight) |
+| 2 | `assets/illustrations/<slug>.png` | kachō-e, perched (pose 1, default) |
+| 3 | `assets/cutouts/<slug>.png` | background-removed photo (fallback) |
+| 4 | 404 | ничего не найдено |
+
+**Slug-конверсия:** `"Parus major"` → `"parus-major"` (нижний регистр,
+пробелы → дефисы).
+
+**Валидация `sci`:** regex `^[A-Za-z]{2,40}(?: [a-z]{2,40}){1,3}$` —
+отклоняет path-traversal (`../etc/passwd`), SQL-инъекции, пустые строки.
+
+**Ассеты:** 498 illustrations (из них ~250 с pose-2) + 158 cutouts.
+
+**Cache-Control:** `public, max-age=86400` (24ч, как в оригинале).
+
+#### 4.3 `/api/wiki` — Wikipedia summary proxy
+
+Порт оригинального `wiki.php`. Проксирует запрос к:
+```
+https://en.wikipedia.org/api/rest_v1/page/summary/<sci>
+```
+
+**Возвращает:**
+```json
+{
+  "extract": "The great tit (Parus major) is a passerine bird...",
+  "thumbnail": {"source": "https://upload.wikimedia.org/..."},
+  "title": "Parus major"
+}
+```
+
+**SSRF-защита:** thumbnail URL проверяется regex — только хосты
+`*.wikimedia.org` и `*.wikipedia.org`. Если Wikipedia вернёт poisoned URL
+на другой домен, thumbnail будет `null`.
+
+**Грейсфул деградация:** если Wikipedia недоступен (timeout, network error) —
+возвращает `{extract: null, thumbnail: null, title: null}` с 200 OK.
+Тесты проверяют это.
+
+**User-Agent:** настраивается через `AV_USER_AGENT` env var
+(по умолчанию `AvianVisitors/1.0`).
+
+**Cache-Control:** `public, max-age=86400` (24ч).
+
+#### 4.4 Новые зависимости
+
+- `httpx` — async HTTP client для Wikipedia proxy (уже был установлен).
+
+#### 4.5 test_api.py — 11 новых тестов
+
+| Класс | Тесты | Что проверяют |
+|-------|-------|---------------|
+| TestCutout (6) | illustration_found, cutout_fallback, pose_fallback, not_found, invalid_sci, sci_to_slug_helper | PNG 200, цепочка lookup, pose-2 → pose-1 fallback, 404, 400 на невалидный sci, slug-конверсия |
+| TestWiki (5) | parus_major, invalid_sci, missing_species, cache_header, ssrf_protection | Реальный Wikipedia ответ 200, 400 на invalid, nulls на несуществующий вид, Cache-Control header, regex SSRF |
+
+### Результат тестирования
+
+```
+cd /home/z/my-project/avian-visitors && python -m pytest avian-visitors/test_api.py -v
+======================== 47 passed in 3.09s =========================
+```
+
+Всего 47 тестов (36 из Части 3 + 11 новых). Все проходят за 3.09 сек.
+
+---

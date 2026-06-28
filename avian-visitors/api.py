@@ -2,7 +2,8 @@
 api.py — FastAPI endpoints for AvianVisitors Desktop.
 
 Exposes JSON endpoints that map 1:1 to database.py methods,
-plus an audio file upload endpoint that delegates to audio_capture.analyze_file().
+plus an audio file upload endpoint that delegates to audio_capture.analyze_file(),
+static file serving, bird image resolver (/api/cutout), and Wikipedia proxy (/api/wiki).
 
 Endpoints:
   GET  /api/stats              → Database.stats()
@@ -13,6 +14,10 @@ Endpoints:
   GET  /api/firstseen          → Database.firstseen(limit)
   POST /api/upload             → analyze_file() from audio_capture.py
   GET  /api/listener/status    → AudioListener diagnostics
+  GET  /api/cutout             → Bird image resolver (illustrations → cutouts)
+  GET  /api/wiki               → Wikipedia summary proxy
+  GET  /favicon.png            → Favicon
+  GET  /{path}                 → Static files (frontend/)
 
 The Database and (optional) AudioListener instances are created at module level
 and initialised via the lifespan() context manager, so that every endpoint
@@ -21,16 +26,42 @@ shares the same objects.
 
 import logging
 import os
+import re
 import tempfile
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
+import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from database import Database
 from audio_capture import AudioListener, analyze_file, LATITUDE, LONGITUDE, CONFIDENCE_THRESHOLD
 
 logger = logging.getLogger("avian.api")
+
+# ── Asset directories (resolved relative to this file) ──────────────── #
+
+_HERE = Path(__file__).resolve().parent
+_ASSETS_DIR = _HERE / "assets"
+_ILLUSTRATIONS_DIR = _ASSETS_DIR / "illustrations"
+_CUTOUTS_DIR = _ASSETS_DIR / "cutouts"
+_FAVICON = _ASSETS_DIR / "favicon.png"
+
+# Regex for validating scientific names (binomial or trinomial)
+_SCI_RE = re.compile(r'^[A-Za-z]{2,40}(?: [a-z]{2,40}){1,3}$')
+
+# Wikipedia proxy settings
+_WIKIPEDIA_UA = os.environ.get(
+    "AV_USER_AGENT",
+    "AvianVisitors/1.0 (+https://github.com/Twarner491/AvianVisitors)",
+)
+_WIKIMEDIA_HOST_RE = re.compile(
+    r'^(?:[^.]+\.)?(?:wikimedia\.org|wikipedia\.org)$', re.IGNORECASE
+)
 
 # ── Module-level singletons (set during lifespan) ──────────────────── #
 
@@ -248,3 +279,139 @@ async def upload_audio(
             os.unlink(tmp_path)
         except OSError:
             pass
+
+
+# ── Bird image resolver (/api/cutout) ──────────────────────────────── #
+
+def _sci_to_slug(sci: str) -> str:
+    """Convert scientific name to filesystem slug.
+
+    Example: "Parus major" → "parus-major"
+    """
+    slug = re.sub(r'[^a-z0-9]+', '-', sci.lower())
+    return slug.strip('-')
+
+
+def _find_image(sci: str, pose: int = 1) -> Optional[Path]:
+    """Resolve bird image through the lookup chain.
+
+    1. illustrations/<slug>-<pose>.png (pose-specific kachō-e)
+    2. illustrations/<slug>.png       (default pose kachō-e)
+    3. cutouts/<slug>.png            (background-removed photo)
+
+    Returns the first existing file > 1 KB, or None.
+    """
+    slug = _sci_to_slug(sci)
+
+    # Pose-specific illustration (e.g. -2 for flight)
+    if pose != 1:
+        pose_path = _ILLUSTRATIONS_DIR / f"{slug}-{pose}.png"
+        if pose_path.is_file() and pose_path.stat().st_size > 1024:
+            return pose_path
+
+    # Default illustration (pose 1)
+    default_path = _ILLUSTRATIONS_DIR / f"{slug}.png"
+    if default_path.is_file() and default_path.stat().st_size > 1024:
+        return default_path
+
+    # Cutout fallback (background-removed photo)
+    cutout_path = _CUTOUTS_DIR / f"{slug}.png"
+    if cutout_path.is_file() and cutout_path.stat().st_size > 1024:
+        return cutout_path
+
+    return None
+
+
+@app.get("/api/cutout")
+async def cutout(
+    sci: str = Query(..., description="Scientific name, e.g. 'Parus major'"),
+    pose: int = Query(default=1, ge=1, le=99, description="Pose variant (1=perched, 2+=flight)"),
+):
+    """Resolve a bird image for the given species.
+
+    Lookup chain (mirrors the original PHP cutout.php):
+      1. Bundled kachō-e illustration with pose suffix
+      2. Bundled kachō-e illustration default pose (fallback for missing pose variant)
+      3. Bundled background-removed photo (cutout)
+      4. 404 if nothing found
+
+    Response is a PNG with Cache-Control: public, max-age=86400 (24h).
+    """
+    if not _SCI_RE.match(sci):
+        raise HTTPException(status_code=400, detail="invalid sci")
+
+    image_path = _find_image(sci, pose)
+    if image_path is None:
+        raise HTTPException(status_code=404, detail=f"no illustration for {sci}")
+
+    return FileResponse(
+        image_path,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ── Wikipedia summary proxy (/api/wiki) ────────────────────────────── #
+
+@app.get("/api/wiki")
+async def wiki(
+    sci: str = Query(..., description="Scientific name, e.g. 'Parus major'"),
+):
+    """Proxy for Wikipedia REST API summary.
+
+    Returns {extract, thumbnail, title} for the species article.
+    The thumbnail URL is validated to only allow wikimedia.org / wikipedia.org hosts
+    (SSRF protection, same as the original PHP wiki.php).
+    Cached by the browser for 24 hours.
+    """
+    if not _SCI_RE.match(sci):
+        raise HTTPException(status_code=400, detail="invalid sci")
+
+    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{sci}"
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            resp = await client.get(url, headers={"User-Agent": _WIKIPEDIA_UA})
+            if resp.status_code != 200:
+                return JSONResponse(
+                    content={"extract": None, "thumbnail": None, "title": None},
+                    headers={"Cache-Control": "public, max-age=86400"},
+                )
+            data = resp.json()
+    except (httpx.TimeoutException, httpx.RequestError) as e:
+        logger.warning("Wikipedia fetch failed for %s: %s", sci, e)
+        return JSONResponse(
+            content={"extract": None, "thumbnail": None, "title": None},
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    # Extract and validate thumbnail URL (SSRF protection)
+    thumbnail = None
+    raw_thumb = data.get("thumbnail", {}).get("source")
+    if raw_thumb:
+        host = urlparse(raw_thumb).hostname or ""
+        if _WIKIMEDIA_HOST_RE.match(host):
+            thumbnail = {"source": raw_thumb}
+
+    return JSONResponse(
+        content={
+            "extract": data.get("extract"),
+            "thumbnail": thumbnail,
+            "title": data.get("title"),
+        },
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+# ── Static files & favicon (must be AFTER all /api/* routes) ────────── #
+
+@app.get("/favicon.png", include_in_schema=False)
+async def favicon():
+    if _FAVICON.is_file():
+        return FileResponse(_FAVICON, media_type="image/png")
+    raise HTTPException(status_code=404)
+
+# Frontend static files — served from frontend/ directory
+_frontend_dir = _HERE / "frontend"
+if _frontend_dir.is_dir():
+    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
